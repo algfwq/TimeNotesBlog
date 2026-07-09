@@ -1,0 +1,9 @@
+bin/
+data/
+logs/
+web/assets/
+web/index.html
+*.exe
+config.json
+frontend/node_modules/
+frontend/dist/

@@ -1,0 +1,33 @@
+{
+  "addr": "127.0.0.1:8090",
+  "dbPath": "data/blog.db",
+  "notesDir": "data/notes",
+  "logPath": "logs/timenotes-blog.log",
+  "logMaxBytes": 5242880,
+  "jwtSecret": "change-me-to-a-long-random-secret",
+  "passwordPepper": "",
+  "ipHashPepper": "timenotes-blog-ip",
+  "maxUploadBytes": 104857600,
+  "maxMessageBytes": 2097152,
+  "corsOrigins": [],
+  "allowLoopbackOrigins": true,
+  "trustedProxies": [],
+  "powBaseDifficulty": 4,
+  "powMaxDifficulty": 20,
+  "jwtExpiryHours": 24,
+  "maxWSConnPerIPPerMinute": 60,
+  "maxLoginPerIPPerMinute": 20,
+  "maxCommentPerIPPerMinute": 30,
+  "geo": {
+    "provider": "ip-api",
+    "urlTemplate": "http://ip-api.com/json/{ip}?fields=status,message,country,regionName,city,lat,lon,query",
+    "apiKey": "",
+    "timeoutMs": 3000,
+    "cacheTTLHours": 168,
+    "countryField": "country",
+    "regionField": "regionName",
+    "cityField": "city",
+    "latField": "lat",
+    "lngField": "lon"
+  }
+}
