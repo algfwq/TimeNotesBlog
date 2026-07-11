@@ -7,20 +7,22 @@ import { AdminApp } from './pages/admin/AdminApp';
 
 Toast.config({ duration: 2 });
 
-function isAdminPath() {
-  return location.pathname.includes('/admin/');
+function adminBasename(): string | null {
+  // /admin/{token} or /admin/{token}/...
+  const m = location.pathname.match(/^\/admin\/([^/]+)/);
+  if (!m) {
+    return null;
+  }
+  return `/admin/${m[1]}`;
 }
 
 export default function App() {
-  // Admin SPA is served under /admin/{token}/ ; use relative routing via basename detection.
-  if (isAdminPath()) {
-    const parts = location.pathname.split('/').filter(Boolean);
-    // admin / {token} / ...
-    const basenames = parts.length >= 2 ? `/${parts[0]}/${parts[1]}` : '/admin';
+  const adminBase = adminBasename();
+  if (adminBase) {
     return (
       <>
         <GlassBackground />
-        <BrowserRouter basename={basenames}>
+        <BrowserRouter basename={adminBase}>
           <Routes>
             <Route path="/*" element={<AdminApp />} />
           </Routes>

@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { Button, Input, SideSheet, Spin, TextArea, Toast, Typography } from '@douyinfe/semi-ui';
-import { IconArrowLeft, IconComment, IconLikeThumb } from '@douyinfe/semi-icons';
+import { Button, SideSheet, Spin, TextArea, Toast, Typography } from '@douyinfe/semi-ui';
+import { IconArrowLeft, IconComment, IconDownload, IconLikeThumb } from '@douyinfe/semi-icons';
 import { blogWS } from '../lib/wsClient';
 import { loadTNoteFromUrl, type NoteDocument } from '../lib/tnote';
 import { ReaderView } from '../components/ReaderView';
+import { CommentIdentityModal } from '../components/CommentIdentityModal';
+import { readCommentIdentity, writeCommentIdentity, type CommentIdentity } from '../lib/commentIdentity';
 
 type Note = {
   id: string;
@@ -13,6 +15,14 @@ type Note = {
   likeCount: number;
   commentCount: number;
   downloadUrl?: string;
+  publicDownload?: boolean;
+  coverUrl?: string;
+};
+
+type NoteGetResponse = {
+  note: Note;
+  liked: boolean;
+  canDownload?: boolean;
 };
 
 type Comment = {
@@ -54,38 +64,42 @@ export function ReaderPage() {
   const [liked, setLiked] = useState(false);
   const [comments, setComments] = useState<Comment[]>([]);
   const [sheetOpen, setSheetOpen] = useState(false);
-  const [nickname, setNickname] = useState('');
-  const [email, setEmail] = useState('');
-  const [githubUrl, setGithubUrl] = useState('');
   const [content, setContent] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [identityOpen, setIdentityOpen] = useState(false);
+  const [identity, setIdentity] = useState<CommentIdentity | null>(() => readCommentIdentity());
+  const [canDownload, setCanDownload] = useState(false);
+
+  const loadAll = async () => {
+    await blogWS.connect();
+    const res = await blogWS.request<NoteGetResponse>('notes.get', { id });
+    setNote(res.note);
+    setLiked(Boolean(res.liked));
+    setCanDownload(Boolean(res.canDownload));
+    const url = res.note.downloadUrl || '';
+    if (url) {
+      const absolute = url.startsWith('http') ? url : `${location.origin}${url}`;
+      const loaded = await loadTNoteFromUrl(absolute);
+      setDoc(loaded);
+    } else {
+      setDoc(null);
+    }
+    const cl = await blogWS.request<{ comments: Comment[] }>('notes.comments.list', { id });
+    setComments(cl.comments || []);
+    void blogWS.request('visit.track', {
+      path: `/note/${id}`,
+      noteId: id,
+      userAgent: navigator.userAgent,
+    }).catch(() => undefined);
+  };
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        await blogWS.connect();
-        const res = await blogWS.request<{ note: Note; liked: boolean }>('notes.get', { id });
-        if (cancelled) return;
-        setNote(res.note);
-        setLiked(Boolean(res.liked));
-        const url = res.note.downloadUrl || '';
-        const absolute = url.startsWith('http') ? url : `${location.origin}${url}`;
-        const loaded = await loadTNoteFromUrl(absolute);
-        if (!cancelled) {
-          setDoc(loaded);
-        }
-        const cl = await blogWS.request<{ comments: Comment[] }>('notes.comments.list', { id });
-        if (!cancelled) {
-          setComments(cl.comments || []);
-        }
-        void blogWS.request('visit.track', {
-          path: `/note/${id}`,
-          noteId: id,
-          userAgent: navigator.userAgent,
-        }).catch(() => undefined);
+        await loadAll();
       } catch (e) {
-        Toast.error(`打开失败：${String(e)}`);
+        if (!cancelled) Toast.error(`打开失败：${String(e)}`);
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -93,7 +107,46 @@ export function ReaderPage() {
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  useEffect(() => {
+    const unsubs = [
+      blogWS.on('event.like.changed', (payload) => {
+        const p = payload as { noteId?: string; likeCount?: number };
+        if (p.noteId !== id) return;
+        setNote((n) => (n ? { ...n, likeCount: Number(p.likeCount || n.likeCount) } : n));
+      }),
+      blogWS.on('event.comment.created', (payload) => {
+        const p = payload as { noteId?: string; comment?: Comment; commentCount?: number };
+        if (p.noteId !== id || !p.comment) return;
+        setComments((prev) => (prev.some((c) => c.id === p.comment!.id) ? prev : [p.comment!, ...prev]));
+        setNote((n) => (n ? { ...n, commentCount: Number(p.commentCount ?? n.commentCount + 1) } : n));
+      }),
+      blogWS.on('event.note.deleted', (payload) => {
+        const p = payload as { id?: string };
+        if (p.id !== id) return;
+        Toast.warning('该手账已不可用');
+        navigate('/');
+      }),
+      blogWS.on('event.note.changed', (payload) => {
+        const p = payload as { note?: Note };
+        if (!p.note || p.note.id !== id) return;
+        setNote((n) => (n ? { ...n, ...p.note } : p.note || n));
+      }),
+      blogWS.onSnapshot(async () => {
+        try {
+          await loadAll();
+        } catch {
+          // ignore reconnect snapshot failures
+        }
+      }),
+    ];
+    return () => {
+      unsubs.forEach((u) => u());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, navigate]);
 
   const title = useMemo(() => note?.title || doc?.title || '手账', [note, doc]);
 
@@ -112,14 +165,14 @@ export function ReaderPage() {
     }
   };
 
-  const onComment = async () => {
+  const submitComment = async (who: CommentIdentity) => {
     setSubmitting(true);
     try {
       const res = await blogWS.request<{ comment: Comment }>('notes.comment.create', {
         id,
-        nickname,
-        email,
-        githubUrl,
+        nickname: who.nickname,
+        email: who.email,
+        githubUrl: who.githubUrl,
         content,
       });
       setComments((prev) => [res.comment, ...prev]);
@@ -131,6 +184,19 @@ export function ReaderPage() {
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const onComment = async () => {
+    if (!content.trim()) {
+      Toast.warning('请输入评论内容');
+      return;
+    }
+    const who = identity || readCommentIdentity();
+    if (!who) {
+      setIdentityOpen(true);
+      return;
+    }
+    await submitComment(who);
   };
 
   if (loading) {
@@ -160,6 +226,27 @@ export function ReaderPage() {
           <Button icon={<IconComment />} theme="light" onClick={() => setSheetOpen(true)}>
             评论 {note?.commentCount ?? 0}
           </Button>
+          {canDownload ? (
+            <Button
+              icon={<IconDownload />}
+              theme="light"
+              onClick={async () => {
+                try {
+                  // Re-issue a fresh one-time token for the explicit download action.
+                  const res = await blogWS.request<NoteGetResponse>('notes.get', { id });
+                  const url = res.note.downloadUrl || '';
+                  if (!url) {
+                    throw new Error('download unavailable');
+                  }
+                  window.location.href = url.startsWith('http') ? url : `${location.origin}${url}`;
+                } catch (e) {
+                  Toast.error(String(e));
+                }
+              }}
+            >
+              下载
+            </Button>
+          ) : null}
         </div>
       </div>
 
@@ -174,11 +261,8 @@ export function ReaderPage() {
         width={Math.min(420, window.innerWidth)}
       >
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <Input placeholder="昵称" value={nickname} onChange={setNickname} />
-          <Input placeholder="联系邮箱（与 GitHub 二选一）" value={email} onChange={setEmail} />
-          <Input placeholder="GitHub 主页链接（可选）" value={githubUrl} onChange={setGithubUrl} />
           <TextArea placeholder="写下你的评论" value={content} onChange={setContent} rows={4} />
-          <Button theme="solid" type="primary" loading={submitting} onClick={onComment}>
+          <Button theme="solid" type="primary" loading={submitting} onClick={() => void onComment()}>
             发表评论
           </Button>
           <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -212,6 +296,18 @@ export function ReaderPage() {
           </div>
         </div>
       </SideSheet>
+
+      <CommentIdentityModal
+        visible={identityOpen}
+        initial={identity}
+        onCancel={() => setIdentityOpen(false)}
+        onSubmit={(next) => {
+          writeCommentIdentity(next);
+          setIdentity(next);
+          setIdentityOpen(false);
+          void submitComment(next);
+        }}
+      />
     </div>
   );
 }

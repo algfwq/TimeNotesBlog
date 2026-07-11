@@ -12,33 +12,38 @@ var (
 	ErrAlreadyLiked  = errors.New("already liked")
 	ErrInvalidInput  = errors.New("invalid input")
 	ErrForbidden     = errors.New("forbidden")
+	ErrLastAdmin     = errors.New("last admin")
 )
 
 type User struct {
-	ID           string `json:"id"`
-	Username     string `json:"username"`
-	PasswordHash string `json:"-"`
-	Role         string `json:"role"`
-	CanUpload    bool   `json:"canUpload"`
-	CreatedAt    string `json:"createdAt"`
-	UpdatedAt    string `json:"updatedAt"`
+	ID                    string `json:"id"`
+	Username              string `json:"username"`
+	PasswordHash          string `json:"-"`
+	Role                  string `json:"role"`
+	CanUpload             bool   `json:"canUpload"`
+	MustChangeCredentials bool   `json:"mustChangeCredentials"`
+	CreatedAt             string `json:"createdAt"`
+	UpdatedAt             string `json:"updatedAt"`
 }
 
 type Note struct {
-	ID           string `json:"id"`
-	OwnerUserID  string `json:"ownerUserId"`
-	OwnerName    string `json:"ownerName,omitempty"`
-	Filename     string `json:"filename"`
-	Title        string `json:"title"`
-	StoragePath  string `json:"-"`
-	SizeBytes    int64  `json:"sizeBytes"`
-	SHA256       string `json:"sha256"`
-	Visible      bool   `json:"visible"`
-	LikeCount    int64  `json:"likeCount"`
-	CommentCount int64  `json:"commentCount"`
-	CreatedAt    string `json:"createdAt"`
-	UpdatedAt    string `json:"updatedAt"`
-	DownloadURL  string `json:"downloadUrl,omitempty"`
+	ID             string `json:"id"`
+	OwnerUserID    string `json:"ownerUserId"`
+	OwnerName      string `json:"ownerName,omitempty"`
+	Filename       string `json:"filename"`
+	Title          string `json:"title"`
+	StoragePath    string `json:"-"`
+	CoverPath      string `json:"coverPath,omitempty"`
+	SizeBytes      int64  `json:"sizeBytes"`
+	SHA256         string `json:"sha256"`
+	Visible        bool   `json:"visible"`
+	PublicDownload bool   `json:"publicDownload"`
+	LikeCount      int64  `json:"likeCount"`
+	CommentCount   int64  `json:"commentCount"`
+	CreatedAt      string `json:"createdAt"`
+	UpdatedAt      string `json:"updatedAt"`
+	DownloadURL    string `json:"downloadUrl,omitempty"`
+	CoverURL       string `json:"coverUrl,omitempty"`
 }
 
 type Comment struct {
@@ -109,12 +114,14 @@ type Store interface {
 
 	EnsureAdmin(ctx context.Context, username, passwordHash string) (created bool, err error)
 	CountUsers(ctx context.Context) (int64, error)
+	CountAdmins(ctx context.Context) (int64, error)
 	CreateUser(ctx context.Context, user User) error
 	GetUserByUsername(ctx context.Context, username string) (*User, error)
 	GetUserByID(ctx context.Context, id string) (*User, error)
 	ListUsers(ctx context.Context) ([]User, error)
 	UpdateUser(ctx context.Context, user User) error
 	DeleteUser(ctx context.Context, id string) error
+	DeleteUserAndTransferNotes(ctx context.Context, userID, targetAdminID string) error
 	UsernameExists(ctx context.Context, username string, excludeID string) (bool, error)
 
 	CreateNote(ctx context.Context, note Note) error
@@ -124,6 +131,7 @@ type Store interface {
 	ListVisibleNotes(ctx context.Context) ([]Note, error)
 	ListAllNotes(ctx context.Context) ([]Note, error)
 	SetNoteVisible(ctx context.Context, id string, visible bool) error
+	SetNotePublicDownload(ctx context.Context, id string, enabled bool) error
 	DeleteNote(ctx context.Context, id string) error
 
 	AddLike(ctx context.Context, noteID, ipHash string) error
@@ -139,10 +147,12 @@ type Store interface {
 	CreateDownloadToken(ctx context.Context, token, noteID string, expiresAt time.Time) error
 	ConsumeDownloadToken(ctx context.Context, token string) (noteID string, err error)
 	GetDownloadToken(ctx context.Context, token string) (noteID string, expiresAt time.Time, err error)
+	DeleteExpiredDownloadTokens(ctx context.Context, now time.Time) error
 
 	GetGeoCache(ctx context.Context, ipHash string, maxAge time.Duration) (*GeoInfo, error)
 	PutGeoCache(ctx context.Context, ipHash string, info GeoInfo) error
 
 	AddVisit(ctx context.Context, v Visit) error
+	BackfillVisitGeo(ctx context.Context, ipHash string, info GeoInfo) error
 	GetVisitStats(ctx context.Context, recentDays int) (*VisitStats, error)
 }

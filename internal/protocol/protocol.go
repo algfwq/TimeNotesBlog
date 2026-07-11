@@ -41,6 +41,18 @@ const (
 	TypeAdminUserUpdate    = "admin.users.update"
 	TypeAdminStats         = "admin.stats"
 	TypeAdminSelfUpdate    = "admin.self.update"
+	TypeAdminNoteSetPublicDownload = "admin.notes.set_public_download"
+	TypeAdminNoteDownload  = "admin.notes.download"
+
+	TypeEventsSubscribe   = "events.subscribe"
+	TypeEventsUnsubscribe = "events.unsubscribe"
+	TypeEventNoteChanged  = "event.note.changed"
+	TypeEventNoteDeleted  = "event.note.deleted"
+	TypeEventCommentCreated = "event.comment.created"
+	TypeEventLikeChanged  = "event.like.changed"
+	TypeEventUserChanged  = "event.user.changed"
+	TypeEventStatsChanged = "event.stats.changed"
+	TypeEventSiteSettingsChanged = "event.site-settings.changed"
 )
 
 type Envelope struct {

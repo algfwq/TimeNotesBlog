@@ -29,41 +29,55 @@ import (
 )
 
 type Options struct {
-	Addr                    string
-	NotesDir                string
-	JWTSecret               string
-	PasswordPepper          string
-	IPHashPepper            string
-	MaxUploadBytes          int64
-	MaxMessageBytes         int64
-	PowBaseDifficulty       int
-	PowMaxDifficulty        int
-	JWTExpiry               time.Duration
-	ReadDeadline            time.Duration
-	MaxWSConnPerIPPerMinute int
-	MaxLoginPerIPPerMinute  int
+	Addr                     string
+	NotesDir                 string
+	CoversDir                string
+	JWTSecret                string
+	PasswordPepper           string
+	IPHashPepper             string
+	MaxUploadBytes           int64
+	MaxMessageBytes          int64
+	PowBaseDifficulty        int
+	PowMaxDifficulty         int
+	JWTExpiry                time.Duration
+	ReadDeadline             time.Duration
+	MaxWSConnPerIPPerMinute  int
+	MaxLoginPerIPPerMinute   int
 	MaxCommentPerIPPerMinute int
-	TrustedProxies          []string
-	AdminPathToken          string
-	GeoCacheTTL             time.Duration
-	AllowOrigin             func(origin string) bool
-	PublicBaseURL           string
+	MaxChallengePerIPPerMinute int
+	UploadTTL                time.Duration
+	LimiterIdleTTL           time.Duration
+	TrustedProxies           []string
+	AdminPathToken           string
+	GeoCacheTTL              time.Duration
+	AllowOrigin              func(origin string) bool
+	PublicBaseURL            string
 }
 
 type Hub struct {
-	store   storage.Store
-	opts    Options
-	pow     *auth.PoWManager
-	geo     geo.Provider
-	uploads sync.Map // uploadID -> *uploadState
-	wsLimit sync.Map // ip -> *rate.Limiter
-	loginLimit sync.Map
+	store        storage.Store
+	opts         Options
+	pow          *auth.PoWManager
+	geo          geo.Provider
+	events       *eventHub
+	uploads      sync.Map // uploadID -> *uploadState
+	wsLimit      sync.Map // ip -> *rateBucket
+	loginLimit   sync.Map
 	commentLimit sync.Map
-	trusted  []*net.IPNet
-	mu       sync.Mutex
+	challengeLimit sync.Map
+	trusted      []*net.IPNet
+	archive      ArchiveLimits
+	stopCleanup  chan struct{}
+	cleanupOnce  sync.Once
+}
+
+type rateBucket struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
 }
 
 type uploadState struct {
+	mu        sync.Mutex
 	ID        string
 	UserID    string
 	NoteID    string // empty for create, set for update
@@ -73,19 +87,23 @@ type uploadState struct {
 	TmpPath   string
 	File      *os.File
 	Received  int64
+	NextIndex int
 	CreatedAt time.Time
+	ExpiresAt time.Time
 	IsAdmin   bool
 }
 
 type clientSession struct {
-	conn     *websocket.Conn
-	ip       string
-	ipHash   string
-	user     *auth.Claims
-	send     chan protocol.Envelope
-	hub      *Hub
-	closed   chan struct{}
+	conn      *websocket.Conn
+	ip        string
+	ipHash    string
+	wsSession string
+	user      *auth.Claims
+	send      chan protocol.Envelope
+	hub       *Hub
+	closed    chan struct{}
 	closeOnce sync.Once
+	eventsOn  bool
 }
 
 func NewHub(store storage.Store, geoProvider geo.Provider, opts Options) *Hub {
@@ -101,15 +119,31 @@ func NewHub(store storage.Store, geoProvider geo.Provider, opts Options) *Hub {
 	if opts.MaxWSConnPerIPPerMinute <= 0 {
 		opts.MaxWSConnPerIPPerMinute = 60
 	}
+	if opts.MaxChallengePerIPPerMinute <= 0 {
+		opts.MaxChallengePerIPPerMinute = 30
+	}
 	if opts.GeoCacheTTL <= 0 {
 		opts.GeoCacheTTL = 7 * 24 * time.Hour
 	}
+	if opts.UploadTTL <= 0 {
+		opts.UploadTTL = 30 * time.Minute
+	}
+	if opts.LimiterIdleTTL <= 0 {
+		opts.LimiterIdleTTL = time.Hour
+	}
+	if strings.TrimSpace(opts.CoversDir) == "" {
+		opts.CoversDir = filepath.Join(filepath.Dir(opts.NotesDir), "covers")
+	}
 	_ = os.MkdirAll(opts.NotesDir, 0o755)
+	_ = os.MkdirAll(opts.CoversDir, 0o755)
 	h := &Hub{
-		store: store,
-		opts:  opts,
-		pow:   auth.NewPoWManager(opts.PowBaseDifficulty, opts.PowMaxDifficulty),
-		geo:   geoProvider,
+		store:       store,
+		opts:        opts,
+		pow:         auth.NewPoWManager(opts.PowBaseDifficulty, opts.PowMaxDifficulty),
+		geo:         geoProvider,
+		events:      newEventHub(),
+		archive:     defaultArchiveLimits(opts.MaxUploadBytes),
+		stopCleanup: make(chan struct{}),
 	}
 	for _, p := range opts.TrustedProxies {
 		if _, n, err := net.ParseCIDR(p); err == nil {
@@ -122,7 +156,65 @@ func NewHub(store storage.Store, geoProvider geo.Provider, opts Options) *Hub {
 			h.trusted = append(h.trusted, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
 		}
 	}
+	go h.cleanupLoop()
 	return h
+}
+
+func (h *Hub) Close() {
+	h.cleanupOnce.Do(func() {
+		close(h.stopCleanup)
+	})
+}
+
+func (h *Hub) cleanupLoop() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.stopCleanup:
+			return
+		case <-ticker.C:
+			h.cleanupUploads()
+			h.cleanupLimiters()
+			_ = h.store.DeleteExpiredDownloadTokens(context.Background(), time.Now())
+		}
+	}
+}
+
+func (h *Hub) cleanupUploads() {
+	now := time.Now()
+	h.uploads.Range(func(key, value any) bool {
+		st := value.(*uploadState)
+		st.mu.Lock()
+		expired := now.After(st.ExpiresAt)
+		path := st.TmpPath
+		file := st.File
+		st.mu.Unlock()
+		if !expired {
+			return true
+		}
+		h.uploads.Delete(key)
+		if file != nil {
+			_ = file.Close()
+		}
+		if path != "" {
+			_ = os.Remove(path)
+		}
+		return true
+	})
+}
+
+func (h *Hub) cleanupLimiters() {
+	cutoff := time.Now().Add(-h.opts.LimiterIdleTTL)
+	for _, m := range []*sync.Map{&h.wsLimit, &h.loginLimit, &h.commentLimit, &h.challengeLimit} {
+		m.Range(func(key, value any) bool {
+			b := value.(*rateBucket)
+			if b.lastSeen.Before(cutoff) {
+				m.Delete(key)
+			}
+			return true
+		})
+	}
 }
 
 func (h *Hub) RegisterRoutes(app *fiber.App) {
@@ -131,6 +223,7 @@ func (h *Hub) RegisterRoutes(app *fiber.App) {
 	})
 
 	app.Get("/files/:token", h.handleDownload)
+	app.Get("/covers/:id", h.handleCover)
 
 	app.Use("/ws", func(c fiber.Ctx) error {
 		if !websocket.IsWebSocketUpgrade(c) {
@@ -144,6 +237,7 @@ func (h *Hub) RegisterRoutes(app *fiber.App) {
 		if !h.allowWS(ip) {
 			return fiber.ErrTooManyRequests
 		}
+		c.Locals("clientIP", ip)
 		return c.Next()
 	})
 
@@ -162,24 +256,34 @@ func (h *Hub) clientIP(c fiber.Ctx) string {
 		return remote
 	}
 	rip := net.ParseIP(remote)
-	trusted := false
-	for _, n := range h.trusted {
-		if rip != nil && n.Contains(rip) {
-			trusted = true
-			break
-		}
-	}
-	if !trusted {
+	if !h.isTrustedIP(rip) {
 		return remote
 	}
 	parts := strings.Split(xff, ",")
+	// Walk right-to-left, skipping trusted proxies, and keep the nearest client IP.
 	for i := len(parts) - 1; i >= 0; i-- {
-		ip := strings.TrimSpace(parts[i])
-		if net.ParseIP(ip) != nil {
-			return ip
+		ip := net.ParseIP(strings.TrimSpace(parts[i]))
+		if ip == nil {
+			continue
 		}
+		if h.isTrustedIP(ip) {
+			continue
+		}
+		return ip.String()
 	}
 	return remote
+}
+
+func (h *Hub) isTrustedIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	for _, n := range h.trusted {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Hub) allowWS(ip string) bool {
@@ -194,33 +298,49 @@ func (h *Hub) allowComment(ip string) bool {
 	return allowRate(&h.commentLimit, ip, h.opts.MaxCommentPerIPPerMinute)
 }
 
+func (h *Hub) allowChallenge(ip string) bool {
+	return allowRate(&h.challengeLimit, ip, h.opts.MaxChallengePerIPPerMinute)
+}
+
 func allowRate(m *sync.Map, ip string, perMin int) bool {
 	if perMin <= 0 {
 		return true
 	}
-	v, _ := m.LoadOrStore(ip, rate.NewLimiter(rate.Every(time.Minute/time.Duration(perMin)), perMin))
-	return v.(*rate.Limiter).Allow()
+	now := time.Now()
+	v, _ := m.LoadOrStore(ip, &rateBucket{
+		limiter:  rate.NewLimiter(rate.Every(time.Minute/time.Duration(perMin)), perMin),
+		lastSeen: now,
+	})
+	b := v.(*rateBucket)
+	b.lastSeen = now
+	return b.limiter.Allow()
 }
 
 func (h *Hub) serveWS(conn *websocket.Conn) {
-	ip := conn.IP()
+	ip, _ := conn.Locals("clientIP").(string)
+	if ip == "" {
+		ip = conn.IP()
+	}
 	if ip == "" {
 		ip = "0.0.0.0"
 	}
 	cs := &clientSession{
-		conn:   conn,
-		ip:     ip,
-		ipHash: auth.HashIP(ip, h.opts.IPHashPepper),
-		send:   make(chan protocol.Envelope, 64),
-		hub:    h,
-		closed: make(chan struct{}),
+		conn:      conn,
+		ip:        ip,
+		ipHash:    auth.HashIP(ip, h.opts.IPHashPepper),
+		wsSession: protocol.NewID(),
+		send:      make(chan protocol.Envelope, 64),
+		hub:       h,
+		closed:    make(chan struct{}),
 	}
+	h.events.add(cs)
 	go cs.writeLoop()
 	cs.readLoop()
 }
 
 func (cs *clientSession) close() {
 	cs.closeOnce.Do(func() {
+		cs.hub.events.remove(cs)
 		close(cs.closed)
 		_ = cs.conn.Close()
 	})
@@ -341,6 +461,14 @@ func (cs *clientSession) handle(env protocol.Envelope) {
 		cs.handleAdminSelfUpdate(ctx, env)
 	case protocol.TypeAdminStats:
 		cs.handleAdminStats(ctx, env)
+	case protocol.TypeAdminNoteSetPublicDownload:
+		cs.handleAdminSetPublicDownload(ctx, env)
+	case protocol.TypeAdminNoteDownload:
+		cs.handleAdminNoteDownload(ctx, env)
+	case protocol.TypeEventsSubscribe:
+		cs.handleEventsSubscribe(env)
+	case protocol.TypeEventsUnsubscribe:
+		cs.handleEventsUnsubscribe(env)
 	default:
 		cs.replyErr(env.ID, "unknown_type", "unknown message type")
 	}
@@ -351,6 +479,21 @@ func (cs *clientSession) requireUser() (*auth.Claims, error) {
 		return nil, errors.New("unauthorized")
 	}
 	return cs.user, nil
+}
+
+func (cs *clientSession) requireCurrentUser(ctx context.Context) (*storage.User, error) {
+	if cs.user == nil {
+		return nil, errors.New("unauthorized")
+	}
+	u, err := cs.hub.store.GetUserByID(ctx, cs.user.UserID)
+	if err != nil {
+		cs.user = nil
+		return nil, errors.New("unauthorized")
+	}
+	// Keep session claims aligned with live role/username.
+	cs.user.Username = u.Username
+	cs.user.Role = u.Role
+	return u, nil
 }
 
 func (cs *clientSession) requireAdmin() (*auth.Claims, error) {
@@ -364,9 +507,24 @@ func (cs *clientSession) requireAdmin() (*auth.Claims, error) {
 	return u, nil
 }
 
+func (cs *clientSession) requireCurrentAdmin(ctx context.Context) (*storage.User, error) {
+	u, err := cs.requireCurrentUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if u.Role != "admin" {
+		return nil, errors.New("forbidden")
+	}
+	return u, nil
+}
+
 func (cs *clientSession) handlePowChallenge(ctx context.Context, env protocol.Envelope) {
+	if !cs.hub.allowChallenge(cs.ip) {
+		cs.replyErr(env.ID, "rate_limited", "too many challenges")
+		return
+	}
 	failures, _, _ := cs.hub.store.GetLoginFailures(ctx, cs.ipHash)
-	ch, err := cs.hub.pow.Issue(failures)
+	ch, err := cs.hub.pow.IssueBound(cs.ipHash, cs.wsSession, failures)
 	if err != nil {
 		cs.replyErr(env.ID, "pow_error", "failed to issue challenge")
 		return
@@ -392,81 +550,100 @@ func (cs *clientSession) handleLogin(ctx context.Context, env protocol.Envelope)
 		cs.replyErr(env.ID, "bad_payload", "invalid payload")
 		return
 	}
-	// Token re-auth path (no PoW when JWT still valid).
-	if strings.TrimSpace(req.Token) != "" {
+// Token re-auth path (no PoW when JWT still valid).
+		if strings.TrimSpace(req.Token) != "" {
+			claims, err := auth.ParseJWT(cs.hub.opts.JWTSecret, req.Token)
+			if err != nil {
+				cs.replyErr(env.ID, "invalid_token", "token invalid or expired")
+				return
+			}
+			user, err := cs.hub.store.GetUserByID(ctx, claims.UserID)
+			if err != nil {
+				cs.replyErr(env.ID, "invalid_token", "token invalid or expired")
+				return
+			}
+			claims.Username = user.Username
+			claims.Role = user.Role
+			cs.user = claims
+			cs.replyOK(protocol.TypeAuthLogin, env.ID, map[string]any{
+				"token":                 req.Token,
+				"userId":                user.ID,
+				"username":              user.Username,
+				"role":                  user.Role,
+				"canUpload":             user.CanUpload,
+				"mustChangeCredentials": user.MustChangeCredentials,
+				"expiresAt":             claims.Exp,
+			})
+			return
+		}
+
+		ok, err := cs.hub.pow.VerifyBound(req.ChallengeID, cs.ipHash, cs.wsSession, req.Nonce)
+		if err != nil || !ok {
+			_, _ = cs.hub.store.BumpLoginFailure(ctx, cs.ipHash, time.Now())
+			cs.replyErr(env.ID, "pow_failed", "proof of work failed")
+			return
+		}
+		user, err := cs.hub.store.GetUserByUsername(ctx, strings.TrimSpace(req.Username))
+		if err != nil {
+			_, _ = cs.hub.store.BumpLoginFailure(ctx, cs.ipHash, time.Now())
+			cs.replyErr(env.ID, "auth_failed", "invalid username or password")
+			return
+		}
+		match, err := auth.VerifyPassword(user.PasswordHash, req.Password, cs.hub.opts.PasswordPepper)
+		if err != nil || !match {
+			_, _ = cs.hub.store.BumpLoginFailure(ctx, cs.ipHash, time.Now())
+			cs.replyErr(env.ID, "auth_failed", "invalid username or password")
+			return
+		}
+		_ = cs.hub.store.ResetLoginFailures(ctx, cs.ipHash)
+		claims := auth.NewClaims(user.ID, user.Username, user.Role, cs.hub.opts.JWTExpiry)
+		token, err := auth.IssueJWT(cs.hub.opts.JWTSecret, claims)
+		if err != nil {
+			cs.replyErr(env.ID, "token_error", "failed to issue token")
+			return
+		}
+		cs.user = &claims
+		cs.replyOK(protocol.TypeAuthLogin, env.ID, map[string]any{
+			"token":                 token,
+			"userId":                user.ID,
+			"username":              user.Username,
+			"role":                  user.Role,
+			"canUpload":             user.CanUpload,
+			"mustChangeCredentials": user.MustChangeCredentials,
+			"expiresAt":             claims.Exp,
+		})
+	}
+
+	func (cs *clientSession) handleSession(env protocol.Envelope) {
+		req, err := protocol.DecodePayload[struct {
+			Token string `json:"token"`
+		}](env)
+		if err != nil || req.Token == "" {
+			cs.replyErr(env.ID, "bad_payload", "token required")
+			return
+		}
 		claims, err := auth.ParseJWT(cs.hub.opts.JWTSecret, req.Token)
 		if err != nil {
 			cs.replyErr(env.ID, "invalid_token", "token invalid or expired")
 			return
 		}
+		user, err := cs.hub.store.GetUserByID(context.Background(), claims.UserID)
+		if err != nil {
+			cs.replyErr(env.ID, "invalid_token", "token invalid or expired")
+			return
+		}
+		claims.Username = user.Username
+		claims.Role = user.Role
 		cs.user = claims
-		cs.replyOK(protocol.TypeAuthLogin, env.ID, map[string]any{
-			"token":    req.Token,
-			"userId":   claims.UserID,
-			"username": claims.Username,
-			"role":     claims.Role,
-			"expiresAt": claims.Exp,
+		cs.replyOK(protocol.TypeAuthSession, env.ID, map[string]any{
+			"userId":                user.ID,
+			"username":              user.Username,
+			"role":                  user.Role,
+			"canUpload":             user.CanUpload,
+			"mustChangeCredentials": user.MustChangeCredentials,
+			"expiresAt":             claims.Exp,
 		})
-		return
 	}
-
-	ok, err := cs.hub.pow.Verify(req.ChallengeID, req.Nonce)
-	if err != nil || !ok {
-		_, _ = cs.hub.store.BumpLoginFailure(ctx, cs.ipHash, time.Now())
-		cs.replyErr(env.ID, "pow_failed", "proof of work failed")
-		return
-	}
-	user, err := cs.hub.store.GetUserByUsername(ctx, strings.TrimSpace(req.Username))
-	if err != nil {
-		_, _ = cs.hub.store.BumpLoginFailure(ctx, cs.ipHash, time.Now())
-		cs.replyErr(env.ID, "auth_failed", "invalid username or password")
-		return
-	}
-	match, err := auth.VerifyPassword(user.PasswordHash, req.Password, cs.hub.opts.PasswordPepper)
-	if err != nil || !match {
-		_, _ = cs.hub.store.BumpLoginFailure(ctx, cs.ipHash, time.Now())
-		cs.replyErr(env.ID, "auth_failed", "invalid username or password")
-		return
-	}
-	_ = cs.hub.store.ResetLoginFailures(ctx, cs.ipHash)
-	claims := auth.NewClaims(user.ID, user.Username, user.Role, cs.hub.opts.JWTExpiry)
-	token, err := auth.IssueJWT(cs.hub.opts.JWTSecret, claims)
-	if err != nil {
-		cs.replyErr(env.ID, "token_error", "failed to issue token")
-		return
-	}
-	cs.user = &claims
-	cs.replyOK(protocol.TypeAuthLogin, env.ID, map[string]any{
-		"token":     token,
-		"userId":    user.ID,
-		"username":  user.Username,
-		"role":      user.Role,
-		"canUpload": user.CanUpload,
-		"expiresAt": claims.Exp,
-	})
-}
-
-func (cs *clientSession) handleSession(env protocol.Envelope) {
-	req, err := protocol.DecodePayload[struct {
-		Token string `json:"token"`
-	}](env)
-	if err != nil || req.Token == "" {
-		cs.replyErr(env.ID, "bad_payload", "token required")
-		return
-	}
-	claims, err := auth.ParseJWT(cs.hub.opts.JWTSecret, req.Token)
-	if err != nil {
-		cs.replyErr(env.ID, "invalid_token", "token invalid or expired")
-		return
-	}
-	cs.user = claims
-	cs.replyOK(protocol.TypeAuthSession, env.ID, map[string]any{
-		"userId":   claims.UserID,
-		"username": claims.Username,
-		"role":     claims.Role,
-		"expiresAt": claims.Exp,
-	})
-}
 
 func (cs *clientSession) handlePing(env protocol.Envelope) {
 	if _, err := cs.requireUser(); err != nil {
@@ -482,16 +659,40 @@ func (cs *clientSession) handleNotesList(ctx context.Context, env protocol.Envel
 		cs.replyErr(env.ID, "db_error", "failed to list notes")
 		return
 	}
-	cs.replyOK(protocol.TypeNotesList, env.ID, map[string]any{"notes": notes})
+	out := make([]storage.Note, 0, len(notes))
+	for i := range notes {
+		n := publicNoteView(&notes[i])
+		out = append(out, n)
+	}
+	cs.replyOK(protocol.TypeNotesList, env.ID, map[string]any{"notes": out})
 }
 
 func (cs *clientSession) issueDownloadURL(ctx context.Context, noteID string) (string, error) {
 	token := protocol.NewToken(24)
-	exp := time.Now().Add(2 * time.Hour)
+	exp := time.Now().Add(10 * time.Minute)
 	if err := cs.hub.store.CreateDownloadToken(ctx, token, noteID, exp); err != nil {
 		return "", err
 	}
 	return "/files/" + token, nil
+}
+
+func (cs *clientSession) canDownloadNote(ctx context.Context, note *storage.Note) bool {
+	if note == nil {
+		return false
+	}
+	if u, err := cs.requireCurrentUser(ctx); err == nil {
+		if u.Role == "admin" || u.ID == note.OwnerUserID {
+			return true
+		}
+	}
+	return note.Visible && note.PublicDownload
+}
+
+func noteCoverURL(note *storage.Note) string {
+	if note == nil || strings.TrimSpace(note.CoverPath) == "" {
+		return ""
+	}
+	return "/covers/" + note.ID
 }
 
 func (cs *clientSession) handleNotesGet(ctx context.Context, env protocol.Envelope) {
@@ -513,6 +714,9 @@ func (cs *clientSession) handleNotesGet(ctx context.Context, env protocol.Envelo
 			return
 		}
 	}
+	note.CoverURL = noteCoverURL(note)
+	// Reading always needs a short-lived file URL for visible notes. The dedicated
+	// public "download" button is gated by publicDownload (or owner/admin rights).
 	urlPath, err := cs.issueDownloadURL(ctx, note.ID)
 	if err != nil {
 		cs.replyErr(env.ID, "token_error", "failed to issue download")
@@ -520,7 +724,11 @@ func (cs *clientSession) handleNotesGet(ctx context.Context, env protocol.Envelo
 	}
 	note.DownloadURL = urlPath
 	liked, _ := cs.hub.store.HasLiked(ctx, note.ID, cs.ipHash)
-	cs.replyOK(protocol.TypeNotesGet, env.ID, map[string]any{"note": note, "liked": liked})
+	cs.replyOK(protocol.TypeNotesGet, env.ID, map[string]any{
+		"note":           note,
+		"liked":          liked,
+		"canDownload":    cs.canDownloadNote(ctx, note),
+	})
 }
 
 type uploadStartReq struct {
@@ -543,24 +751,21 @@ func safeFilename(name string) string {
 }
 
 func (cs *clientSession) handleUploadStart(ctx context.Context, env protocol.Envelope, isUpdate, forceAdmin bool) {
-	user, err := cs.requireUser()
+	dbUser, err := cs.requireCurrentUser(ctx)
 	if err != nil {
 		cs.replyErr(env.ID, "unauthorized", "login required")
 		return
 	}
-	if forceAdmin {
-		if _, err := cs.requireAdmin(); err != nil {
-			cs.replyErr(env.ID, "forbidden", "admin required")
-			return
-		}
-	}
-	dbUser, err := cs.hub.store.GetUserByID(ctx, user.UserID)
-	if err != nil {
-		cs.replyErr(env.ID, "unauthorized", "user not found")
+	if forceAdmin && dbUser.Role != "admin" {
+		cs.replyErr(env.ID, "forbidden", "admin required")
 		return
 	}
 	if !dbUser.CanUpload && dbUser.Role != "admin" {
 		cs.replyErr(env.ID, "forbidden", "upload not allowed")
+		return
+	}
+	if dbUser.MustChangeCredentials {
+		cs.replyErr(env.ID, "credentials_required", "change default credentials first")
 		return
 	}
 	req, err := protocol.DecodePayload[uploadStartReq](env)
@@ -594,12 +799,12 @@ func (cs *clientSession) handleUploadStart(ctx context.Context, env protocol.Env
 			cs.replyErr(env.ID, "not_found", "note not found")
 			return
 		}
-		if note.OwnerUserID != user.UserID && user.Role != "admin" {
+		if note.OwnerUserID != dbUser.ID && dbUser.Role != "admin" {
 			cs.replyErr(env.ID, "forbidden", "not note owner")
 			return
 		}
 	} else {
-		if existing, err := cs.hub.store.GetNoteByOwnerFilename(ctx, user.UserID, filename); err == nil && existing != nil {
+		if existing, err := cs.hub.store.GetNoteByOwnerFilename(ctx, dbUser.ID, filename); err == nil && existing != nil {
 			cs.replyErr(env.ID, "conflict", "filename already exists; use update")
 			return
 		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
@@ -615,17 +820,20 @@ func (cs *clientSession) handleUploadStart(ctx context.Context, env protocol.Env
 		cs.replyErr(env.ID, "io_error", "failed to create temp file")
 		return
 	}
+	now := time.Now()
 	st := &uploadState{
 		ID:        uploadID,
-		UserID:    user.UserID,
+		UserID:    dbUser.ID,
 		NoteID:    noteID,
 		Filename:  filename,
 		Title:     title,
 		Size:      req.Size,
 		TmpPath:   tmp,
 		File:      f,
-		CreatedAt: time.Now(),
-		IsAdmin:   forceAdmin || user.Role == "admin",
+		NextIndex: 0,
+		CreatedAt: now,
+		ExpiresAt: now.Add(cs.hub.opts.UploadTTL),
+		IsAdmin:   forceAdmin || dbUser.Role == "admin",
 	}
 	cs.hub.uploads.Store(uploadID, st)
 	respType := protocol.TypeNotesUploadStart
@@ -645,7 +853,7 @@ type uploadChunkReq struct {
 }
 
 func (cs *clientSession) handleUploadChunk(env protocol.Envelope) {
-	if _, err := cs.requireUser(); err != nil {
+	if _, err := cs.requireCurrentUser(context.Background()); err != nil {
 		cs.replyErr(env.ID, "unauthorized", "login required")
 		return
 	}
@@ -660,8 +868,18 @@ func (cs *clientSession) handleUploadChunk(env protocol.Envelope) {
 		return
 	}
 	st := v.(*uploadState)
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	if st.UserID != cs.user.UserID && cs.user.Role != "admin" {
 		cs.replyErr(env.ID, "forbidden", "not your upload")
+		return
+	}
+	if time.Now().After(st.ExpiresAt) {
+		cs.replyErr(env.ID, "upload_expired", "upload expired")
+		return
+	}
+	if req.Index != st.NextIndex {
+		cs.replyErr(env.ID, "bad_chunk_index", fmt.Sprintf("expected chunk index %d", st.NextIndex))
 		return
 	}
 	raw, err := base64.StdEncoding.DecodeString(req.Data)
@@ -682,7 +900,8 @@ func (cs *clientSession) handleUploadChunk(env protocol.Envelope) {
 		return
 	}
 	st.Received += int64(len(raw))
-	cs.replyOK(env.Type, env.ID, map[string]any{"uploadId": st.ID, "received": st.Received})
+	st.NextIndex++
+	cs.replyOK(env.Type, env.ID, map[string]any{"uploadId": st.ID, "received": st.Received, "nextIndex": st.NextIndex})
 }
 
 type uploadFinishReq struct {
@@ -691,7 +910,7 @@ type uploadFinishReq struct {
 }
 
 func (cs *clientSession) handleUploadFinish(ctx context.Context, env protocol.Envelope, isUpdate bool) {
-	user, err := cs.requireUser()
+	user, err := cs.requireCurrentUser(ctx)
 	if err != nil {
 		cs.replyErr(env.ID, "unauthorized", "login required")
 		return
@@ -707,13 +926,22 @@ func (cs *clientSession) handleUploadFinish(ctx context.Context, env protocol.En
 		return
 	}
 	st := v.(*uploadState)
+	st.mu.Lock()
 	defer func() {
 		cs.hub.uploads.Delete(req.UploadID)
-		_ = st.File.Close()
+		if st.File != nil {
+			_ = st.File.Close()
+		}
+		st.mu.Unlock()
 	}()
-	if st.UserID != user.UserID && user.Role != "admin" {
+	if st.UserID != user.ID && user.Role != "admin" {
 		_ = os.Remove(st.TmpPath)
 		cs.replyErr(env.ID, "forbidden", "not your upload")
+		return
+	}
+	if time.Now().After(st.ExpiresAt) {
+		_ = os.Remove(st.TmpPath)
+		cs.replyErr(env.ID, "upload_expired", "upload expired")
 		return
 	}
 	if st.Received != st.Size {
@@ -722,6 +950,7 @@ func (cs *clientSession) handleUploadFinish(ctx context.Context, env protocol.En
 		return
 	}
 	_ = st.File.Close()
+	st.File = nil
 	sum, err := fileSHA256(st.TmpPath)
 	if err != nil {
 		_ = os.Remove(st.TmpPath)
@@ -733,57 +962,95 @@ func (cs *clientSession) handleUploadFinish(ctx context.Context, env protocol.En
 		cs.replyErr(env.ID, "hash_mismatch", "sha256 mismatch")
 		return
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	finalName := protocol.NewID() + ".tnote"
-	finalPath := filepath.Join(cs.hub.opts.NotesDir, finalName)
-	if err := os.Rename(st.TmpPath, finalPath); err != nil {
-		// cross-device fallback
-		if err2 := copyFile(st.TmpPath, finalPath); err2 != nil {
-			_ = os.Remove(st.TmpPath)
-			cs.replyErr(env.ID, "io_error", "finalize failed")
+	validated, err := ValidateTNoteArchive(st.TmpPath, cs.hub.archive)
+	if err != nil {
+		_ = os.Remove(st.TmpPath)
+		if strings.Contains(err.Error(), "thumbnail_required") {
+			cs.replyErr(env.ID, "thumbnail_required", "open the notebook in TimeNotes to generate a cover, then upload again")
 			return
 		}
+		cs.replyErr(env.ID, "invalid_archive", err.Error())
+		return
+	}
+	if strings.TrimSpace(st.Title) == "" {
+		st.Title = validated.Title
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	noteID := st.NoteID
+	if noteID == "" {
+		noteID = protocol.NewID()
+	}
+	finalName := noteID + ".tnote"
+	finalPath := filepath.Join(cs.hub.opts.NotesDir, finalName)
+	coverPath := filepath.Join(cs.hub.opts.CoversDir, noteID+".png")
+	tmpFinal := finalPath + ".new"
+	tmpCover := coverPath + ".new"
+	if err := copyFile(st.TmpPath, tmpFinal); err != nil {
 		_ = os.Remove(st.TmpPath)
+		cs.replyErr(env.ID, "io_error", "finalize failed")
+		return
+	}
+	if err := os.WriteFile(tmpCover, validated.ThumbnailPNG, 0o644); err != nil {
+		_ = os.Remove(st.TmpPath)
+		_ = os.Remove(tmpFinal)
+		cs.replyErr(env.ID, "io_error", "cover write failed")
+		return
 	}
 
 	var note *storage.Note
 	if isUpdate || st.NoteID != "" {
 		existing, err := cs.hub.store.GetNote(ctx, st.NoteID)
 		if err != nil {
-			_ = os.Remove(finalPath)
+			_ = os.Remove(st.TmpPath)
+			_ = os.Remove(tmpFinal)
+			_ = os.Remove(tmpCover)
 			cs.replyErr(env.ID, "not_found", "note not found")
 			return
 		}
 		oldPath := existing.StoragePath
+		oldCover := existing.CoverPath
 		existing.Title = st.Title
 		existing.StoragePath = finalPath
+		existing.CoverPath = coverPath
 		existing.SizeBytes = st.Size
 		existing.SHA256 = sum
 		existing.UpdatedAt = now
 		if err := cs.hub.store.UpdateNoteFile(ctx, *existing); err != nil {
-			_ = os.Remove(finalPath)
+			_ = os.Remove(st.TmpPath)
+			_ = os.Remove(tmpFinal)
+			_ = os.Remove(tmpCover)
 			cs.replyErr(env.ID, "db_error", "update failed")
 			return
 		}
+		_ = os.Rename(tmpFinal, finalPath)
+		_ = os.Rename(tmpCover, coverPath)
 		if oldPath != "" && oldPath != finalPath {
 			_ = os.Remove(oldPath)
+		}
+		if oldCover != "" && oldCover != coverPath {
+			_ = os.Remove(oldCover)
 		}
 		note = existing
 	} else {
 		n := storage.Note{
-			ID:          protocol.NewID(),
-			OwnerUserID: user.UserID,
-			Filename:    st.Filename,
-			Title:       st.Title,
-			StoragePath: finalPath,
-			SizeBytes:   st.Size,
-			SHA256:      sum,
-			Visible:     true,
-			CreatedAt:   now,
-			UpdatedAt:   now,
+			ID:             noteID,
+			OwnerUserID:    user.ID,
+			Filename:       st.Filename,
+			Title:          st.Title,
+			StoragePath:    finalPath,
+			CoverPath:      coverPath,
+			SizeBytes:      st.Size,
+			SHA256:         sum,
+			Visible:        true,
+			PublicDownload: false,
+			CreatedAt:      now,
+			UpdatedAt:      now,
 		}
 		if err := cs.hub.store.CreateNote(ctx, n); err != nil {
-			_ = os.Remove(finalPath)
+			_ = os.Remove(st.TmpPath)
+			_ = os.Remove(tmpFinal)
+			_ = os.Remove(tmpCover)
 			if errors.Is(err, storage.ErrConflict) {
 				cs.replyErr(env.ID, "conflict", "filename already exists")
 				return
@@ -791,17 +1058,35 @@ func (cs *clientSession) handleUploadFinish(ctx context.Context, env protocol.En
 			cs.replyErr(env.ID, "db_error", "create failed")
 			return
 		}
+		_ = os.Rename(tmpFinal, finalPath)
+		_ = os.Rename(tmpCover, coverPath)
 		note = &n
 	}
+	_ = os.Remove(st.TmpPath)
 	full, _ := cs.hub.store.GetNote(ctx, note.ID)
 	if full != nil {
 		note = full
 	}
+	note.CoverURL = noteCoverURL(note)
+	cs.hub.events.broadcast(protocol.TypeEventNoteChanged, map[string]any{"note": publicNoteView(note)}, audiencePublic)
+	cs.hub.events.broadcast(protocol.TypeEventNoteChanged, map[string]any{"note": note}, audienceAdmin)
 	respType := protocol.TypeNotesUploadFinish
 	if isUpdate {
 		respType = protocol.TypeNotesUpdateFinish
 	}
 	cs.replyOK(respType, env.ID, map[string]any{"note": note})
+}
+
+func publicNoteView(note *storage.Note) storage.Note {
+	if note == nil {
+		return storage.Note{}
+	}
+	out := *note
+	out.StoragePath = ""
+	out.CoverPath = ""
+	out.DownloadURL = ""
+	out.CoverURL = noteCoverURL(note)
+	return out
 }
 
 func fileSHA256(path string) (string, error) {
@@ -853,9 +1138,13 @@ func (cs *clientSession) handleLike(ctx context.Context, env protocol.Envelope) 
 		cs.replyErr(env.ID, "db_error", "like failed")
 		return
 	}
-	note, _ = cs.hub.store.GetNote(ctx, req.ID)
-	cs.replyOK(protocol.TypeNotesLike, env.ID, map[string]any{"likeCount": note.LikeCount, "liked": true})
-}
+note, _ = cs.hub.store.GetNote(ctx, req.ID)
+		cs.hub.events.broadcast(protocol.TypeEventLikeChanged, map[string]any{
+			"noteId":    req.ID,
+			"likeCount": note.LikeCount,
+		}, audiencePublic)
+		cs.replyOK(protocol.TypeNotesLike, env.ID, map[string]any{"likeCount": note.LikeCount, "liked": true})
+	}
 
 func (cs *clientSession) handleCommentsList(ctx context.Context, env protocol.Envelope) {
 	req, err := protocol.DecodePayload[struct {
@@ -934,12 +1223,19 @@ func (cs *clientSession) handleCommentCreate(ctx context.Context, env protocol.E
 		Content:   content,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	if err := cs.hub.store.AddComment(ctx, c); err != nil {
-		cs.replyErr(env.ID, "db_error", "create failed")
-		return
+if err := cs.hub.store.AddComment(ctx, c); err != nil {
+			cs.replyErr(env.ID, "db_error", "create failed")
+			return
+		}
+		if note, err := cs.hub.store.GetNote(ctx, req.ID); err == nil {
+			cs.hub.events.broadcast(protocol.TypeEventCommentCreated, map[string]any{
+				"noteId":       req.ID,
+				"comment":      c,
+				"commentCount": note.CommentCount,
+			}, audiencePublic)
+		}
+		cs.replyOK(protocol.TypeNotesCommentCreate, env.ID, map[string]any{"comment": c})
 	}
-	cs.replyOK(protocol.TypeNotesCommentCreate, env.ID, map[string]any{"comment": c})
-}
 
 func isGitHubURL(raw string) bool {
 	u, err := url.Parse(raw)
@@ -984,112 +1280,195 @@ func (cs *clientSession) handleVisit(ctx context.Context, env protocol.Envelope)
 		UserAgent: strings.TrimSpace(req.UserAgent),
 		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	if info, err := cs.hub.store.GetGeoCache(ctx, cs.ipHash, cs.hub.opts.GeoCacheTTL); err == nil && info != nil {
-		v.Country, v.Region, v.City = info.Country, info.Region, info.City
-		lat, lng := info.Lat, info.Lng
-		v.Lat, v.Lng = &lat, &lng
-	} else {
-		go cs.hub.resolveGeoAsync(cs.ip, cs.ipHash)
+if info, err := cs.hub.store.GetGeoCache(ctx, cs.ipHash, cs.hub.opts.GeoCacheTTL); err == nil && info != nil {
+			v.Country, v.Region, v.City = info.Country, info.Region, info.City
+			lat, lng := info.Lat, info.Lng
+			v.Lat, v.Lng = &lat, &lng
+		} else {
+			go cs.hub.resolveGeoAsync(cs.ip, cs.ipHash)
+		}
+		if err := cs.hub.store.AddVisit(ctx, v); err != nil {
+			cs.replyErr(env.ID, "db_error", "visit failed")
+			return
+		}
+		cs.hub.events.broadcast(protocol.TypeEventStatsChanged, map[string]any{"reason": "visit"}, audienceAdmin)
+		cs.replyOK(protocol.TypeVisitTrack, env.ID, map[string]any{"ok": true})
 	}
-	if err := cs.hub.store.AddVisit(ctx, v); err != nil {
-		cs.replyErr(env.ID, "db_error", "visit failed")
-		return
-	}
-	cs.replyOK(protocol.TypeVisitTrack, env.ID, map[string]any{"ok": true})
-}
 
-func (h *Hub) resolveGeoAsync(ip, ipHash string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := h.store.GetGeoCache(ctx, ipHash, h.opts.GeoCacheTTL); err == nil {
-		return
+	func (h *Hub) resolveGeoAsync(ip, ipHash string) {
+		// Public GeoIP APIs reject loopback/private ranges; skip to avoid noisy logs.
+		if parsed := net.ParseIP(strings.TrimSpace(ip)); parsed != nil {
+			if parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast() || parsed.IsUnspecified() {
+				return
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := h.store.GetGeoCache(ctx, ipHash, h.opts.GeoCacheTTL); err == nil {
+			return
+		}
+		info, err := h.geo.Lookup(ctx, ip)
+		if err != nil {
+			log.Printf("geo lookup failed ip_hash=%s err=%v", shortHash(ipHash), err)
+			return
+		}
+		_ = h.store.PutGeoCache(ctx, ipHash, info)
+		_ = h.store.BackfillVisitGeo(ctx, ipHash, info)
+		h.events.broadcast(protocol.TypeEventStatsChanged, map[string]any{"reason": "geo"}, audienceAdmin)
 	}
-	info, err := h.geo.Lookup(ctx, ip)
-	if err != nil {
-		log.Printf("geo lookup failed ip_hash=%s err=%v", ipHash[:8], err)
-		return
+
+func shortHash(h string) string {
+	if len(h) >= 8 {
+		return h[:8]
 	}
-	_ = h.store.PutGeoCache(ctx, ipHash, info)
+	return h
 }
 
 func (cs *clientSession) handleAdminNotesList(ctx context.Context, env protocol.Envelope) {
-	if _, err := cs.requireAdmin(); err != nil {
-		cs.replyErr(env.ID, "forbidden", "admin required")
-		return
+		if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+			cs.replyErr(env.ID, "forbidden", "admin required")
+			return
+		}
+		notes, err := cs.hub.store.ListAllNotes(ctx)
+		if err != nil {
+			cs.replyErr(env.ID, "db_error", "list failed")
+			return
+		}
+		for i := range notes {
+			notes[i].CoverURL = noteCoverURL(&notes[i])
+		}
+		cs.replyOK(protocol.TypeAdminNotesList, env.ID, map[string]any{"notes": notes})
 	}
-	notes, err := cs.hub.store.ListAllNotes(ctx)
-	if err != nil {
-		cs.replyErr(env.ID, "db_error", "list failed")
-		return
-	}
-	cs.replyOK(protocol.TypeAdminNotesList, env.ID, map[string]any{"notes": notes})
-}
 
-func (cs *clientSession) handleAdminSetVisible(ctx context.Context, env protocol.Envelope) {
-	if _, err := cs.requireAdmin(); err != nil {
-		cs.replyErr(env.ID, "forbidden", "admin required")
-		return
+	func (cs *clientSession) handleAdminSetVisible(ctx context.Context, env protocol.Envelope) {
+		if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+			cs.replyErr(env.ID, "forbidden", "admin required")
+			return
+		}
+		req, err := protocol.DecodePayload[struct {
+			ID      string `json:"id"`
+			Visible bool   `json:"visible"`
+		}](env)
+		if err != nil || req.ID == "" {
+			cs.replyErr(env.ID, "bad_payload", "invalid payload")
+			return
+		}
+		if err := cs.hub.store.SetNoteVisible(ctx, req.ID, req.Visible); err != nil {
+			cs.replyErr(env.ID, "db_error", "update failed")
+			return
+		}
+		if note, err := cs.hub.store.GetNote(ctx, req.ID); err == nil {
+			if req.Visible {
+				cs.hub.events.broadcast(protocol.TypeEventNoteChanged, map[string]any{"note": publicNoteView(note)}, audiencePublic)
+			} else {
+				cs.hub.events.broadcast(protocol.TypeEventNoteDeleted, map[string]any{"id": req.ID}, audiencePublic)
+			}
+			cs.hub.events.broadcast(protocol.TypeEventNoteChanged, map[string]any{"note": note}, audienceAdmin)
+		}
+		cs.replyOK(protocol.TypeAdminNoteSetVisible, env.ID, map[string]any{"ok": true})
 	}
-	req, err := protocol.DecodePayload[struct {
-		ID      string `json:"id"`
-		Visible bool   `json:"visible"`
-	}](env)
-	if err != nil || req.ID == "" {
-		cs.replyErr(env.ID, "bad_payload", "invalid payload")
-		return
-	}
-	if err := cs.hub.store.SetNoteVisible(ctx, req.ID, req.Visible); err != nil {
-		cs.replyErr(env.ID, "db_error", "update failed")
-		return
-	}
-	cs.replyOK(protocol.TypeAdminNoteSetVisible, env.ID, map[string]any{"ok": true})
-}
 
-func (cs *clientSession) handleAdminDeleteNote(ctx context.Context, env protocol.Envelope) {
-	if _, err := cs.requireAdmin(); err != nil {
-		cs.replyErr(env.ID, "forbidden", "admin required")
-		return
+	func (cs *clientSession) handleAdminSetPublicDownload(ctx context.Context, env protocol.Envelope) {
+		if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+			cs.replyErr(env.ID, "forbidden", "admin required")
+			return
+		}
+		req, err := protocol.DecodePayload[struct {
+			ID      string `json:"id"`
+			Enabled bool   `json:"enabled"`
+		}](env)
+		if err != nil || req.ID == "" {
+			cs.replyErr(env.ID, "bad_payload", "invalid payload")
+			return
+		}
+		if err := cs.hub.store.SetNotePublicDownload(ctx, req.ID, req.Enabled); err != nil {
+			cs.replyErr(env.ID, "db_error", "update failed")
+			return
+		}
+		if note, err := cs.hub.store.GetNote(ctx, req.ID); err == nil {
+			cs.hub.events.broadcast(protocol.TypeEventNoteChanged, map[string]any{"note": publicNoteView(note)}, audiencePublic)
+			cs.hub.events.broadcast(protocol.TypeEventNoteChanged, map[string]any{"note": note}, audienceAdmin)
+		}
+		cs.replyOK(protocol.TypeAdminNoteSetPublicDownload, env.ID, map[string]any{"ok": true, "enabled": req.Enabled})
 	}
-	req, err := protocol.DecodePayload[struct {
-		ID string `json:"id"`
-	}](env)
-	if err != nil || req.ID == "" {
-		cs.replyErr(env.ID, "bad_payload", "id required")
-		return
-	}
-	note, err := cs.hub.store.GetNote(ctx, req.ID)
-	if err != nil {
-		cs.replyErr(env.ID, "not_found", "note not found")
-		return
-	}
-	if err := cs.hub.store.DeleteNote(ctx, req.ID); err != nil {
-		cs.replyErr(env.ID, "db_error", "delete failed")
-		return
-	}
-	if note.StoragePath != "" {
-		_ = os.Remove(note.StoragePath)
-	}
-	cs.replyOK(protocol.TypeAdminNoteDelete, env.ID, map[string]any{"ok": true})
-}
 
-func (cs *clientSession) handleAdminUsersList(ctx context.Context, env protocol.Envelope) {
-	if _, err := cs.requireAdmin(); err != nil {
-		cs.replyErr(env.ID, "forbidden", "admin required")
-		return
+	func (cs *clientSession) handleAdminNoteDownload(ctx context.Context, env protocol.Envelope) {
+		if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+			cs.replyErr(env.ID, "forbidden", "admin required")
+			return
+		}
+		req, err := protocol.DecodePayload[struct {
+			ID string `json:"id"`
+		}](env)
+		if err != nil || req.ID == "" {
+			cs.replyErr(env.ID, "bad_payload", "id required")
+			return
+		}
+		note, err := cs.hub.store.GetNote(ctx, req.ID)
+		if err != nil {
+			cs.replyErr(env.ID, "not_found", "note not found")
+			return
+		}
+		urlPath, err := cs.issueDownloadURL(ctx, note.ID)
+		if err != nil {
+			cs.replyErr(env.ID, "token_error", "failed to issue download")
+			return
+		}
+		cs.replyOK(protocol.TypeAdminNoteDownload, env.ID, map[string]any{
+			"downloadUrl": urlPath,
+			"filename":    note.Filename,
+		})
 	}
-	users, err := cs.hub.store.ListUsers(ctx)
-	if err != nil {
-		cs.replyErr(env.ID, "db_error", "list failed")
-		return
-	}
-	cs.replyOK(protocol.TypeAdminUsersList, env.ID, map[string]any{"users": users})
-}
 
-func (cs *clientSession) handleAdminUserCreate(ctx context.Context, env protocol.Envelope) {
-	if _, err := cs.requireAdmin(); err != nil {
-		cs.replyErr(env.ID, "forbidden", "admin required")
-		return
+	func (cs *clientSession) handleAdminDeleteNote(ctx context.Context, env protocol.Envelope) {
+		if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+			cs.replyErr(env.ID, "forbidden", "admin required")
+			return
+		}
+		req, err := protocol.DecodePayload[struct {
+			ID string `json:"id"`
+		}](env)
+		if err != nil || req.ID == "" {
+			cs.replyErr(env.ID, "bad_payload", "id required")
+			return
+		}
+		note, err := cs.hub.store.GetNote(ctx, req.ID)
+		if err != nil {
+			cs.replyErr(env.ID, "not_found", "note not found")
+			return
+		}
+		if err := cs.hub.store.DeleteNote(ctx, req.ID); err != nil {
+			cs.replyErr(env.ID, "db_error", "delete failed")
+			return
+		}
+		if note.StoragePath != "" {
+			_ = os.Remove(note.StoragePath)
+		}
+		if note.CoverPath != "" {
+			_ = os.Remove(note.CoverPath)
+		}
+		cs.hub.events.broadcast(protocol.TypeEventNoteDeleted, map[string]any{"id": req.ID}, audienceAll)
+		cs.replyOK(protocol.TypeAdminNoteDelete, env.ID, map[string]any{"ok": true})
 	}
+
+	func (cs *clientSession) handleAdminUsersList(ctx context.Context, env protocol.Envelope) {
+		if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+			cs.replyErr(env.ID, "forbidden", "admin required")
+			return
+		}
+		users, err := cs.hub.store.ListUsers(ctx)
+		if err != nil {
+			cs.replyErr(env.ID, "db_error", "list failed")
+			return
+		}
+		cs.replyOK(protocol.TypeAdminUsersList, env.ID, map[string]any{"users": users})
+	}
+
+	func (cs *clientSession) handleAdminUserCreate(ctx context.Context, env protocol.Envelope) {
+		if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+			cs.replyErr(env.ID, "forbidden", "admin required")
+			return
+		}
 	req, err := protocol.DecodePayload[struct {
 		Username  string `json:"username"`
 		Password  string `json:"password"`
@@ -1137,201 +1516,310 @@ func (cs *clientSession) handleAdminUserCreate(ctx context.Context, env protocol
 		cs.replyErr(env.ID, "db_error", "create failed")
 		return
 	}
-	u.PasswordHash = ""
-	cs.replyOK(protocol.TypeAdminUserCreate, env.ID, map[string]any{"user": u})
-}
+u.PasswordHash = ""
+		cs.hub.events.broadcast(protocol.TypeEventUserChanged, map[string]any{"user": u, "action": "create"}, audienceAdmin)
+		cs.replyOK(protocol.TypeAdminUserCreate, env.ID, map[string]any{"user": u})
+	}
 
-func (cs *clientSession) handleAdminUserDelete(ctx context.Context, env protocol.Envelope) {
-	admin, err := cs.requireAdmin()
-	if err != nil {
-		cs.replyErr(env.ID, "forbidden", "admin required")
-		return
-	}
-	req, err := protocol.DecodePayload[struct {
-		ID string `json:"id"`
-	}](env)
-	if err != nil || req.ID == "" {
-		cs.replyErr(env.ID, "bad_payload", "id required")
-		return
-	}
-	if req.ID == admin.UserID {
-		cs.replyErr(env.ID, "forbidden", "cannot delete self")
-		return
-	}
-	if err := cs.hub.store.DeleteUser(ctx, req.ID); err != nil {
-		cs.replyErr(env.ID, "db_error", "delete failed")
-		return
-	}
-	cs.replyOK(protocol.TypeAdminUserDelete, env.ID, map[string]any{"ok": true})
-}
-
-func (cs *clientSession) handleAdminUserUpdate(ctx context.Context, env protocol.Envelope) {
-	if _, err := cs.requireAdmin(); err != nil {
-		cs.replyErr(env.ID, "forbidden", "admin required")
-		return
-	}
-	req, err := protocol.DecodePayload[struct {
-		ID        string  `json:"id"`
-		Username  *string `json:"username"`
-		Password  *string `json:"password"`
-		Role      *string `json:"role"`
-		CanUpload *bool   `json:"canUpload"`
-	}](env)
-	if err != nil || req.ID == "" {
-		cs.replyErr(env.ID, "bad_payload", "invalid payload")
-		return
-	}
-	u, err := cs.hub.store.GetUserByID(ctx, req.ID)
-	if err != nil {
-		cs.replyErr(env.ID, "not_found", "user not found")
-		return
-	}
-	if req.Username != nil {
-		name := strings.TrimSpace(*req.Username)
-		if name == "" {
-			cs.replyErr(env.ID, "bad_payload", "username empty")
-			return
-		}
-		exists, err := cs.hub.store.UsernameExists(ctx, name, u.ID)
+	func (cs *clientSession) handleAdminUserDelete(ctx context.Context, env protocol.Envelope) {
+		admin, err := cs.requireCurrentAdmin(ctx)
 		if err != nil {
-			cs.replyErr(env.ID, "db_error", "check failed")
+			cs.replyErr(env.ID, "forbidden", "admin required")
 			return
 		}
-		if exists {
-			cs.replyErr(env.ID, "conflict", "username exists")
+		req, err := protocol.DecodePayload[struct {
+			ID               string `json:"id"`
+			TransferToAdminID string `json:"transferToAdminId"`
+		}](env)
+		if err != nil || req.ID == "" {
+			cs.replyErr(env.ID, "bad_payload", "id required")
 			return
 		}
-		u.Username = name
+		if req.ID == admin.ID {
+			cs.replyErr(env.ID, "forbidden", "cannot delete self")
+			return
+		}
+		if err := cs.hub.store.DeleteUserAndTransferNotes(ctx, req.ID, strings.TrimSpace(req.TransferToAdminID)); err != nil {
+			switch {
+			case errors.Is(err, storage.ErrLastAdmin):
+				cs.replyErr(env.ID, "last_admin", "cannot delete the last admin")
+			case errors.Is(err, storage.ErrInvalidInput):
+				cs.replyErr(env.ID, "transfer_target_required", "transfer target admin required when user owns notes")
+			case errors.Is(err, storage.ErrNotFound):
+				cs.replyErr(env.ID, "not_found", "user or transfer target not found")
+			case errors.Is(err, storage.ErrForbidden):
+				cs.replyErr(env.ID, "forbidden", "transfer target must be an admin")
+			default:
+				cs.replyErr(env.ID, "db_error", "delete failed")
+			}
+			return
+		}
+		cs.hub.events.broadcast(protocol.TypeEventUserChanged, map[string]any{"id": req.ID, "action": "delete"}, audienceAdmin)
+		cs.hub.events.broadcast(protocol.TypeEventNoteChanged, map[string]any{"reason": "ownership_transfer"}, audienceAdmin)
+		cs.replyOK(protocol.TypeAdminUserDelete, env.ID, map[string]any{"ok": true})
 	}
-	if req.Password != nil && *req.Password != "" {
-		hash, err := auth.HashPassword(*req.Password, cs.hub.opts.PasswordPepper)
+
+	func (cs *clientSession) handleAdminUserUpdate(ctx context.Context, env protocol.Envelope) {
+		if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+			cs.replyErr(env.ID, "forbidden", "admin required")
+			return
+		}
+		req, err := protocol.DecodePayload[struct {
+			ID        string  `json:"id"`
+			Username  *string `json:"username"`
+			Password  *string `json:"password"`
+			Role      *string `json:"role"`
+			CanUpload *bool   `json:"canUpload"`
+		}](env)
+		if err != nil || req.ID == "" {
+			cs.replyErr(env.ID, "bad_payload", "invalid payload")
+			return
+		}
+		u, err := cs.hub.store.GetUserByID(ctx, req.ID)
 		if err != nil {
-			cs.replyErr(env.ID, "hash_error", "hash failed")
+			cs.replyErr(env.ID, "not_found", "user not found")
 			return
 		}
-		u.PasswordHash = hash
-	}
-	if req.Role != nil {
-		if *req.Role == "admin" {
-			u.Role = "admin"
-		} else {
-			u.Role = "user"
+		if req.Username != nil {
+			name := strings.TrimSpace(*req.Username)
+			if name == "" {
+				cs.replyErr(env.ID, "bad_payload", "username empty")
+				return
+			}
+			exists, err := cs.hub.store.UsernameExists(ctx, name, u.ID)
+			if err != nil {
+				cs.replyErr(env.ID, "db_error", "check failed")
+				return
+			}
+			if exists {
+				cs.replyErr(env.ID, "conflict", "username exists")
+				return
+			}
+			u.Username = name
 		}
-	}
-	if req.CanUpload != nil {
-		u.CanUpload = *req.CanUpload
-	}
-	u.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	if err := cs.hub.store.UpdateUser(ctx, *u); err != nil {
-		cs.replyErr(env.ID, "db_error", "update failed")
-		return
-	}
-	u.PasswordHash = ""
-	cs.replyOK(protocol.TypeAdminUserUpdate, env.ID, map[string]any{"user": u})
-}
-
-func (cs *clientSession) handleAdminSelfUpdate(ctx context.Context, env protocol.Envelope) {
-	admin, err := cs.requireAdmin()
-	if err != nil {
-		cs.replyErr(env.ID, "forbidden", "admin required")
-		return
-	}
-	req, err := protocol.DecodePayload[struct {
-		Username *string `json:"username"`
-		Password *string `json:"password"`
-	}](env)
-	if err != nil {
-		cs.replyErr(env.ID, "bad_payload", "invalid payload")
-		return
-	}
-	u, err := cs.hub.store.GetUserByID(ctx, admin.UserID)
-	if err != nil {
-		cs.replyErr(env.ID, "not_found", "user not found")
-		return
-	}
-	if req.Username != nil {
-		name := strings.TrimSpace(*req.Username)
-		if name == "" {
-			cs.replyErr(env.ID, "bad_payload", "username empty")
-			return
+		if req.Password != nil && *req.Password != "" {
+			hash, err := auth.HashPassword(*req.Password, cs.hub.opts.PasswordPepper)
+			if err != nil {
+				cs.replyErr(env.ID, "hash_error", "hash failed")
+				return
+			}
+			u.PasswordHash = hash
 		}
-		exists, err := cs.hub.store.UsernameExists(ctx, name, u.ID)
-		if err != nil || exists {
-			cs.replyErr(env.ID, "conflict", "username exists")
-			return
-		}
-		u.Username = name
-	}
-	if req.Password != nil && *req.Password != "" {
-		hash, err := auth.HashPassword(*req.Password, cs.hub.opts.PasswordPepper)
-		if err != nil {
-			cs.replyErr(env.ID, "hash_error", "hash failed")
-			return
-		}
-		u.PasswordHash = hash
-	}
-	u.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	if err := cs.hub.store.UpdateUser(ctx, *u); err != nil {
-		cs.replyErr(env.ID, "db_error", "update failed")
-		return
-	}
-	cs.replyOK(protocol.TypeAdminSelfUpdate, env.ID, map[string]any{"ok": true, "username": u.Username})
-}
-
-func (cs *clientSession) handleAdminStats(ctx context.Context, env protocol.Envelope) {
-	if _, err := cs.requireAdmin(); err != nil {
-		cs.replyErr(env.ID, "forbidden", "admin required")
-		return
-	}
-	stats, err := cs.hub.store.GetVisitStats(ctx, 14)
-	if err != nil {
-		cs.replyErr(env.ID, "db_error", "stats failed")
-		return
-	}
-	cs.replyOK(protocol.TypeAdminStats, env.ID, stats)
-}
-
-func (h *Hub) handleDownload(c fiber.Ctx) error {
-	token := c.Params("token")
-	if token == "" {
-		return fiber.ErrNotFound
-	}
-	noteID, exp, err := h.store.GetDownloadToken(c.Context(), token)
-	if err != nil || time.Now().After(exp) {
-		return fiber.ErrNotFound
-	}
-	note, err := h.store.GetNote(c.Context(), noteID)
-	if err != nil {
-		return fiber.ErrNotFound
-	}
-	if !note.Visible {
-		// still allow with valid token (issued after auth/get)
-	}
-	c.Set("Content-Type", "application/octet-stream")
-	c.Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, note.Filename))
-	return c.SendFile(note.StoragePath)
-}
-
-// MountStatic serves SPA for public and admin paths.
-func MountStatic(app *fiber.App, webDir, adminToken string) {
-	index := filepath.Join(webDir, "index.html")
-	app.Get("/admin/"+adminToken, func(c fiber.Ctx) error {
-		return c.Redirect().To("/admin/" + adminToken + "/")
-	})
-	app.Get("/admin/"+adminToken+"/*", func(c fiber.Ctx) error {
-		rel := strings.TrimPrefix(c.Path(), "/admin/"+adminToken)
-		rel = strings.TrimPrefix(rel, "/")
-		if rel == "" {
-			return c.SendFile(index)
-		}
-		candidate := filepath.Join(webDir, filepath.Clean(rel))
-		if strings.HasPrefix(candidate, webDir) {
-			if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
-				return c.SendFile(candidate)
+		if req.Role != nil {
+			nextRole := "user"
+			if *req.Role == "admin" {
+				nextRole = "admin"
+			}
+			if u.Role == "admin" && nextRole != "admin" {
+				count, err := cs.hub.store.CountAdmins(ctx)
+				if err != nil {
+					cs.replyErr(env.ID, "db_error", "check failed")
+					return
+				}
+				if count <= 1 {
+					cs.replyErr(env.ID, "last_admin", "cannot demote the last admin")
+					return
+				}
+			}
+			u.Role = nextRole
+			if nextRole == "admin" {
+				u.CanUpload = true
 			}
 		}
+		if req.CanUpload != nil {
+			u.CanUpload = *req.CanUpload || u.Role == "admin"
+		}
+		u.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		if err := cs.hub.store.UpdateUser(ctx, *u); err != nil {
+			cs.replyErr(env.ID, "db_error", "update failed")
+			return
+		}
+		u.PasswordHash = ""
+		cs.hub.events.broadcast(protocol.TypeEventUserChanged, map[string]any{"user": u, "action": "update"}, audienceAdmin)
+		cs.replyOK(protocol.TypeAdminUserUpdate, env.ID, map[string]any{"user": u})
+	}
+
+	func (cs *clientSession) handleAdminSelfUpdate(ctx context.Context, env protocol.Envelope) {
+		admin, err := cs.requireCurrentAdmin(ctx)
+		if err != nil {
+			cs.replyErr(env.ID, "forbidden", "admin required")
+			return
+		}
+		req, err := protocol.DecodePayload[struct {
+			Username *string `json:"username"`
+			Password *string `json:"password"`
+		}](env)
+		if err != nil {
+			cs.replyErr(env.ID, "bad_payload", "invalid payload")
+			return
+		}
+		u, err := cs.hub.store.GetUserByID(ctx, admin.ID)
+		if err != nil {
+			cs.replyErr(env.ID, "not_found", "user not found")
+			return
+		}
+		usernameProvided := req.Username != nil && strings.TrimSpace(*req.Username) != ""
+		passwordProvided := req.Password != nil && strings.TrimSpace(*req.Password) != ""
+		if u.MustChangeCredentials && (!usernameProvided || !passwordProvided) {
+			cs.replyErr(env.ID, "credentials_required", "both username and password are required")
+			return
+		}
+		if usernameProvided {
+			name := strings.TrimSpace(*req.Username)
+			if name == "" {
+				cs.replyErr(env.ID, "bad_payload", "username empty")
+				return
+			}
+			if strings.EqualFold(name, "admin") && u.MustChangeCredentials {
+				cs.replyErr(env.ID, "bad_payload", "choose a non-default username")
+				return
+			}
+			exists, err := cs.hub.store.UsernameExists(ctx, name, u.ID)
+			if err != nil || exists {
+				cs.replyErr(env.ID, "conflict", "username exists")
+				return
+			}
+			u.Username = name
+		}
+		if passwordProvided {
+			if *req.Password == "123456" && u.MustChangeCredentials {
+				cs.replyErr(env.ID, "bad_payload", "choose a non-default password")
+				return
+			}
+			hash, err := auth.HashPassword(*req.Password, cs.hub.opts.PasswordPepper)
+			if err != nil {
+				cs.replyErr(env.ID, "hash_error", "hash failed")
+				return
+			}
+			u.PasswordHash = hash
+		}
+		if u.MustChangeCredentials && usernameProvided && passwordProvided {
+			u.MustChangeCredentials = false
+		}
+		u.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		if err := cs.hub.store.UpdateUser(ctx, *u); err != nil {
+			cs.replyErr(env.ID, "db_error", "update failed")
+			return
+		}
+		if cs.user != nil {
+			cs.user.Username = u.Username
+		}
+		cs.hub.events.broadcast(protocol.TypeEventUserChanged, map[string]any{"user": map[string]any{
+			"id": u.ID, "username": u.Username, "role": u.Role, "canUpload": u.CanUpload, "mustChangeCredentials": u.MustChangeCredentials,
+		}, "action": "self_update"}, audienceAdmin)
+		cs.replyOK(protocol.TypeAdminSelfUpdate, env.ID, map[string]any{
+			"ok":                    true,
+			"username":              u.Username,
+			"mustChangeCredentials": u.MustChangeCredentials,
+		})
+	}
+
+	func (cs *clientSession) handleAdminStats(ctx context.Context, env protocol.Envelope) {
+		if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+			cs.replyErr(env.ID, "forbidden", "admin required")
+			return
+		}
+		stats, err := cs.hub.store.GetVisitStats(ctx, 14)
+		if err != nil {
+			cs.replyErr(env.ID, "db_error", "stats failed")
+			return
+		}
+		cs.replyOK(protocol.TypeAdminStats, env.ID, stats)
+	}
+
+	func (cs *clientSession) handleEventsSubscribe(env protocol.Envelope) {
+		cs.eventsOn = true
+		cs.replyOK(protocol.TypeEventsSubscribe, env.ID, map[string]any{"ok": true})
+	}
+
+	func (cs *clientSession) handleEventsUnsubscribe(env protocol.Envelope) {
+		cs.eventsOn = false
+		cs.replyOK(protocol.TypeEventsUnsubscribe, env.ID, map[string]any{"ok": true})
+	}
+
+	func (h *Hub) handleDownload(c fiber.Ctx) error {
+		token := c.Params("token")
+		if token == "" {
+			return fiber.ErrNotFound
+		}
+		noteID, err := h.store.ConsumeDownloadToken(c.Context(), token)
+		if err != nil {
+			return fiber.ErrNotFound
+		}
+		note, err := h.store.GetNote(c.Context(), noteID)
+		if err != nil {
+			return fiber.ErrNotFound
+		}
+		filename := safeFilename(note.Filename)
+		if filename == "" {
+			filename = note.ID + ".tnote"
+		}
+		c.Set("Content-Type", "application/octet-stream")
+		c.Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, strings.ReplaceAll(filename, `"`, "")))
+		return c.SendFile(note.StoragePath)
+	}
+
+	func (h *Hub) handleCover(c fiber.Ctx) error {
+		id := strings.TrimSpace(c.Params("id"))
+		if id == "" || strings.Contains(id, "/") || strings.Contains(id, "\\") || strings.Contains(id, "..") {
+			return fiber.ErrNotFound
+		}
+		note, err := h.store.GetNote(c.Context(), id)
+		if err != nil {
+			return fiber.ErrNotFound
+		}
+		if !note.Visible {
+			// Covers for hidden notes are admin-only; public cover endpoint hides existence.
+			return fiber.ErrNotFound
+		}
+		if strings.TrimSpace(note.CoverPath) == "" {
+			return fiber.ErrNotFound
+		}
+		c.Set("Content-Type", "image/png")
+		c.Set("Cache-Control", "public, max-age=3600")
+		return c.SendFile(note.CoverPath)
+	}
+
+// MountStatic serves SPA for public and admin paths.
+// Important: do NOT redirect between /admin/{token} and /admin/{token}/.
+// Fiber's trailing-slash normalization would otherwise create ERR_TOO_MANY_REDIRECTS.
+func MountStatic(app *fiber.App, webDir, adminToken string) {
+	absWeb, err := filepath.Abs(webDir)
+	if err != nil {
+		absWeb = webDir
+	}
+	index := filepath.Join(absWeb, "index.html")
+	adminPrefix := "/admin/" + adminToken
+
+	serveSPA := func(c fiber.Ctx, rel string) error {
+		rel = strings.TrimPrefix(rel, "/")
+		if rel == "" || rel == "." {
+			return c.SendFile(index)
+		}
+		// Prevent path traversal while resolving assets under web/.
+		candidate := filepath.Join(absWeb, filepath.Clean("/"+rel))
+		if !strings.HasPrefix(candidate, absWeb+string(os.PathSeparator)) && candidate != absWeb {
+			return c.SendFile(index)
+		}
+		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+			return c.SendFile(candidate)
+		}
 		return c.SendFile(index)
-	})
+	}
+
+	adminHandler := func(c fiber.Ctx) error {
+		path := c.Path()
+		// Accept both /admin/{token} and /admin/{token}/... without redirects.
+		if path != adminPrefix && !strings.HasPrefix(path, adminPrefix+"/") {
+			return c.Status(http.StatusNotFound).SendString("invalid admin path")
+		}
+		rel := strings.TrimPrefix(path, adminPrefix)
+		return serveSPA(c, rel)
+	}
+
+	app.Get(adminPrefix, adminHandler)
+	app.Get(adminPrefix+"/", adminHandler)
+	app.Get(adminPrefix+"/*", adminHandler)
 
 	app.Get("/*", func(c fiber.Ctx) error {
 		path := c.Path()
@@ -1341,14 +1829,6 @@ func MountStatic(app *fiber.App, webDir, adminToken string) {
 		if strings.HasPrefix(path, "/admin/") {
 			return c.Status(http.StatusNotFound).SendString("invalid admin path")
 		}
-		rel := strings.TrimPrefix(path, "/")
-		if rel == "" {
-			return c.SendFile(index)
-		}
-		candidate := filepath.Join(webDir, filepath.Clean(rel))
-		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
-			return c.SendFile(candidate)
-		}
-		return c.SendFile(index)
+		return serveSPA(c, path)
 	})
 }

@@ -14,6 +14,8 @@ type Pending = {
   timer: number;
 };
 
+type EventListener = (payload: unknown, env: Envelope) => void;
+
 function wsURL(): string {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${location.host}/ws`;
@@ -24,6 +26,10 @@ export class BlogWS {
   private pending = new Map<string, Pending>();
   private token = '';
   private openPromise: Promise<void> | null = null;
+  private listeners = new Map<string, Set<EventListener>>();
+  private reconnectTimer: number | null = null;
+  private shouldReconnect = true;
+  private snapshotHandlers = new Set<() => void | Promise<void>>();
 
   setToken(token: string) {
     this.token = token;
@@ -33,6 +39,23 @@ export class BlogWS {
     return this.token;
   }
 
+  on(type: string, listener: EventListener) {
+    if (!this.listeners.has(type)) {
+      this.listeners.set(type, new Set());
+    }
+    this.listeners.get(type)!.add(listener);
+    return () => this.off(type, listener);
+  }
+
+  off(type: string, listener: EventListener) {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  onSnapshot(handler: () => void | Promise<void>) {
+    this.snapshotHandlers.add(handler);
+    return () => this.snapshotHandlers.delete(handler);
+  }
+
   async connect(): Promise<void> {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       return;
@@ -40,12 +63,14 @@ export class BlogWS {
     if (this.openPromise) {
       return this.openPromise;
     }
+    this.shouldReconnect = true;
     this.openPromise = new Promise((resolve, reject) => {
       const ws = new WebSocket(wsURL());
       this.ws = ws;
       ws.onopen = () => {
         this.openPromise = null;
         resolve();
+        void this.afterOpen();
       };
       ws.onerror = () => {
         this.openPromise = null;
@@ -58,6 +83,7 @@ export class BlogWS {
           p.reject(new Error('connection closed'));
         }
         this.pending.clear();
+        this.scheduleReconnect();
       };
       ws.onmessage = (ev) => {
         try {
@@ -71,6 +97,19 @@ export class BlogWS {
             } else {
               p.resolve(env);
             }
+            return;
+          }
+          const set = this.listeners.get(env.type);
+          if (set) {
+            for (const listener of set) {
+              listener(env.payload, env);
+            }
+          }
+          const all = this.listeners.get('*');
+          if (all) {
+            for (const listener of all) {
+              listener(env.payload, env);
+            }
           }
         } catch {
           // ignore malformed
@@ -78,6 +117,30 @@ export class BlogWS {
       };
     });
     return this.openPromise;
+  }
+
+  private scheduleReconnect() {
+    if (!this.shouldReconnect || this.reconnectTimer != null) {
+      return;
+    }
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.connect().catch(() => undefined);
+    }, 1500);
+  }
+
+  private async afterOpen() {
+    try {
+      if (this.token) {
+        await this.ensureSession(this.token);
+      }
+      await this.request('events.subscribe', {}).catch(() => undefined);
+      for (const handler of this.snapshotHandlers) {
+        await handler();
+      }
+    } catch {
+      // reconnect path should not crash the socket
+    }
   }
 
   async request<T = unknown>(type: string, payload?: unknown, timeoutMs = 30000): Promise<T> {
@@ -106,13 +169,15 @@ export class BlogWS {
       'auth.pow.challenge',
       {},
     );
-    const nonce = await solvePow(challenge.salt, challenge.difficulty);
+    // Bound PoW is enforced server-side against this websocket session/IP.
+    const nonce = await solvePow(challenge.salt, challenge.difficulty, {});
     const result = await this.request<{
       token: string;
       userId: string;
       username: string;
       role: string;
       canUpload?: boolean;
+      mustChangeCredentials?: boolean;
       expiresAt: number;
     }>('auth.login', {
       username,
@@ -131,6 +196,8 @@ export class BlogWS {
       userId: string;
       username: string;
       role: string;
+      canUpload?: boolean;
+      mustChangeCredentials?: boolean;
       expiresAt: number;
     }>('auth.login', { token });
     this.token = result.token || token;
@@ -142,8 +209,26 @@ export class BlogWS {
     if (!t) {
       throw new Error('no token');
     }
-    await this.request('auth.session', { token: t });
+    const result = await this.request<{
+      userId: string;
+      username: string;
+      role: string;
+      canUpload?: boolean;
+      mustChangeCredentials?: boolean;
+      expiresAt: number;
+    }>('auth.session', { token: t });
     this.token = t;
+    return result;
+  }
+
+  close() {
+    this.shouldReconnect = false;
+    if (this.reconnectTimer != null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.ws?.close();
+    this.ws = null;
   }
 }
 

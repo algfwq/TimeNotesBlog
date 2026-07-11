@@ -90,8 +90,8 @@ func (s *Store) EnsureAdmin(ctx context.Context, username, passwordHash string) 
 		return false, nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO users(id, username, password_hash, role, can_upload, created_at, updated_at)
-		VALUES(?, ?, ?, 'admin', 1, ?, ?)`, "admin", username, passwordHash, now, now)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO users(id, username, password_hash, role, can_upload, must_change_credentials, created_at, updated_at)
+		VALUES(?, ?, ?, 'admin', 1, 1, ?, ?)`, "admin", username, passwordHash, now, now)
 	return err == nil, err
 }
 
@@ -101,14 +101,24 @@ func (s *Store) CountUsers(ctx context.Context) (int64, error) {
 	return n, err
 }
 
+func (s *Store) CountAdmins(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM users WHERE role = 'admin'`).Scan(&n)
+	return n, err
+}
+
 func (s *Store) CreateUser(ctx context.Context, user storage.User) error {
 	can := 0
 	if user.CanUpload {
 		can = 1
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO users(id, username, password_hash, role, can_upload, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?)`,
-		user.ID, user.Username, user.PasswordHash, user.Role, can, user.CreatedAt, user.UpdatedAt)
+	mustChange := 0
+	if user.MustChangeCredentials {
+		mustChange = 1
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO users(id, username, password_hash, role, can_upload, must_change_credentials, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		user.ID, user.Username, user.PasswordHash, user.Role, can, mustChange, user.CreatedAt, user.UpdatedAt)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "unique") {
 		return storage.ErrConflict
 	}
@@ -117,29 +127,30 @@ func (s *Store) CreateUser(ctx context.Context, user storage.User) error {
 
 func scanUser(row interface{ Scan(dest ...any) error }) (*storage.User, error) {
 	var u storage.User
-	var can int
-	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &can, &u.CreatedAt, &u.UpdatedAt); err != nil {
+	var can, mustChange int
+	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &can, &mustChange, &u.CreatedAt, &u.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, storage.ErrNotFound
 		}
 		return nil, err
 	}
 	u.CanUpload = can == 1
+	u.MustChangeCredentials = mustChange == 1
 	return &u, nil
 }
 
 func (s *Store) GetUserByUsername(ctx context.Context, username string) (*storage.User, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, username, password_hash, role, can_upload, created_at, updated_at FROM users WHERE username = ?`, username)
+	row := s.db.QueryRowContext(ctx, `SELECT id, username, password_hash, role, can_upload, must_change_credentials, created_at, updated_at FROM users WHERE username = ?`, username)
 	return scanUser(row)
 }
 
 func (s *Store) GetUserByID(ctx context.Context, id string) (*storage.User, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, username, password_hash, role, can_upload, created_at, updated_at FROM users WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, username, password_hash, role, can_upload, must_change_credentials, created_at, updated_at FROM users WHERE id = ?`, id)
 	return scanUser(row)
 }
 
 func (s *Store) ListUsers(ctx context.Context) ([]storage.User, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, username, password_hash, role, can_upload, created_at, updated_at FROM users ORDER BY created_at ASC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, username, password_hash, role, can_upload, must_change_credentials, created_at, updated_at FROM users ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -160,8 +171,12 @@ func (s *Store) UpdateUser(ctx context.Context, user storage.User) error {
 	if user.CanUpload {
 		can = 1
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE users SET username=?, password_hash=?, role=?, can_upload=?, updated_at=? WHERE id=?`,
-		user.Username, user.PasswordHash, user.Role, can, user.UpdatedAt, user.ID)
+	mustChange := 0
+	if user.MustChangeCredentials {
+		mustChange = 1
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE users SET username=?, password_hash=?, role=?, can_upload=?, must_change_credentials=?, updated_at=? WHERE id=?`,
+		user.Username, user.PasswordHash, user.Role, can, mustChange, user.UpdatedAt, user.ID)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return storage.ErrConflict
@@ -176,7 +191,65 @@ func (s *Store) UpdateUser(ctx context.Context, user storage.User) error {
 }
 
 func (s *Store) DeleteUser(ctx context.Context, id string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, id)
+	return s.DeleteUserAndTransferNotes(ctx, id, "")
+}
+
+func (s *Store) DeleteUserAndTransferNotes(ctx context.Context, userID, targetAdminID string) error {
+	if strings.TrimSpace(userID) == "" {
+		return storage.ErrInvalidInput
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var role string
+	if err := tx.QueryRowContext(ctx, `SELECT role FROM users WHERE id = ?`, userID).Scan(&role); err != nil {
+		if err == sql.ErrNoRows {
+			return storage.ErrNotFound
+		}
+		return err
+	}
+
+	if role == "admin" {
+		var admins int64
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM users WHERE role = 'admin'`).Scan(&admins); err != nil {
+			return err
+		}
+		if admins <= 1 {
+			return storage.ErrLastAdmin
+		}
+	}
+
+	var noteCount int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM notes WHERE owner_user_id = ?`, userID).Scan(&noteCount); err != nil {
+		return err
+	}
+	if noteCount > 0 {
+		if strings.TrimSpace(targetAdminID) == "" {
+			return storage.ErrInvalidInput
+		}
+		if targetAdminID == userID {
+			return storage.ErrInvalidInput
+		}
+		var targetRole string
+		if err := tx.QueryRowContext(ctx, `SELECT role FROM users WHERE id = ?`, targetAdminID).Scan(&targetRole); err != nil {
+			if err == sql.ErrNoRows {
+				return storage.ErrNotFound
+			}
+			return err
+		}
+		if targetRole != "admin" {
+			return storage.ErrForbidden
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE notes SET owner_user_id = ?, updated_at = ? WHERE owner_user_id = ?`,
+			targetAdminID, time.Now().UTC().Format(time.RFC3339Nano), userID); err != nil {
+			return err
+		}
+	}
+
+	res, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, userID)
 	if err != nil {
 		return err
 	}
@@ -184,7 +257,7 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 	if n == 0 {
 		return storage.ErrNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *Store) UsernameExists(ctx context.Context, username string, excludeID string) (bool, error) {
@@ -204,12 +277,12 @@ func (s *Store) UsernameExists(ctx context.Context, username string, excludeID s
 
 func scanNote(row interface{ Scan(dest ...any) error }, withOwner bool) (*storage.Note, error) {
 	var n storage.Note
-	var visible int
+	var visible, publicDownload int
 	var err error
 	if withOwner {
-		err = row.Scan(&n.ID, &n.OwnerUserID, &n.OwnerName, &n.Filename, &n.Title, &n.StoragePath, &n.SizeBytes, &n.SHA256, &visible, &n.LikeCount, &n.CommentCount, &n.CreatedAt, &n.UpdatedAt)
+		err = row.Scan(&n.ID, &n.OwnerUserID, &n.OwnerName, &n.Filename, &n.Title, &n.StoragePath, &n.CoverPath, &n.SizeBytes, &n.SHA256, &visible, &publicDownload, &n.LikeCount, &n.CommentCount, &n.CreatedAt, &n.UpdatedAt)
 	} else {
-		err = row.Scan(&n.ID, &n.OwnerUserID, &n.Filename, &n.Title, &n.StoragePath, &n.SizeBytes, &n.SHA256, &visible, &n.LikeCount, &n.CommentCount, &n.CreatedAt, &n.UpdatedAt)
+		err = row.Scan(&n.ID, &n.OwnerUserID, &n.Filename, &n.Title, &n.StoragePath, &n.CoverPath, &n.SizeBytes, &n.SHA256, &visible, &publicDownload, &n.LikeCount, &n.CommentCount, &n.CreatedAt, &n.UpdatedAt)
 	}
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -218,6 +291,7 @@ func scanNote(row interface{ Scan(dest ...any) error }, withOwner bool) (*storag
 		return nil, err
 	}
 	n.Visible = visible == 1
+	n.PublicDownload = publicDownload == 1
 	return &n, nil
 }
 
@@ -226,9 +300,13 @@ func (s *Store) CreateNote(ctx context.Context, note storage.Note) error {
 	if note.Visible {
 		visible = 1
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO notes(id, owner_user_id, filename, title, storage_path, size_bytes, sha256, visible, like_count, comment_count, created_at, updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-		note.ID, note.OwnerUserID, note.Filename, note.Title, note.StoragePath, note.SizeBytes, note.SHA256, visible, note.LikeCount, note.CommentCount, note.CreatedAt, note.UpdatedAt)
+	publicDownload := 0
+	if note.PublicDownload {
+		publicDownload = 1
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO notes(id, owner_user_id, filename, title, storage_path, cover_path, size_bytes, sha256, visible, public_download, like_count, comment_count, created_at, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		note.ID, note.OwnerUserID, note.Filename, note.Title, note.StoragePath, note.CoverPath, note.SizeBytes, note.SHA256, visible, publicDownload, note.LikeCount, note.CommentCount, note.CreatedAt, note.UpdatedAt)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "unique") {
 		return storage.ErrConflict
 	}
@@ -236,8 +314,8 @@ func (s *Store) CreateNote(ctx context.Context, note storage.Note) error {
 }
 
 func (s *Store) UpdateNoteFile(ctx context.Context, note storage.Note) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE notes SET title=?, storage_path=?, size_bytes=?, sha256=?, updated_at=? WHERE id=?`,
-		note.Title, note.StoragePath, note.SizeBytes, note.SHA256, note.UpdatedAt, note.ID)
+	res, err := s.db.ExecContext(ctx, `UPDATE notes SET title=?, storage_path=?, cover_path=?, size_bytes=?, sha256=?, updated_at=? WHERE id=?`,
+		note.Title, note.StoragePath, note.CoverPath, note.SizeBytes, note.SHA256, note.UpdatedAt, note.ID)
 	if err != nil {
 		return err
 	}
@@ -249,19 +327,19 @@ func (s *Store) UpdateNoteFile(ctx context.Context, note storage.Note) error {
 }
 
 func (s *Store) GetNote(ctx context.Context, id string) (*storage.Note, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT n.id, n.owner_user_id, COALESCE(u.username,''), n.filename, n.title, n.storage_path, n.size_bytes, n.sha256, n.visible, n.like_count, n.comment_count, n.created_at, n.updated_at
+	row := s.db.QueryRowContext(ctx, `SELECT n.id, n.owner_user_id, COALESCE(u.username,''), n.filename, n.title, n.storage_path, n.cover_path, n.size_bytes, n.sha256, n.visible, n.public_download, n.like_count, n.comment_count, n.created_at, n.updated_at
 		FROM notes n LEFT JOIN users u ON u.id = n.owner_user_id WHERE n.id = ?`, id)
 	return scanNote(row, true)
 }
 
 func (s *Store) GetNoteByOwnerFilename(ctx context.Context, ownerID, filename string) (*storage.Note, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, owner_user_id, filename, title, storage_path, size_bytes, sha256, visible, like_count, comment_count, created_at, updated_at
+	row := s.db.QueryRowContext(ctx, `SELECT id, owner_user_id, filename, title, storage_path, cover_path, size_bytes, sha256, visible, public_download, like_count, comment_count, created_at, updated_at
 		FROM notes WHERE owner_user_id = ? AND filename = ?`, ownerID, filename)
 	return scanNote(row, false)
 }
 
 func (s *Store) listNotes(ctx context.Context, onlyVisible bool) ([]storage.Note, error) {
-	q := `SELECT n.id, n.owner_user_id, COALESCE(u.username,''), n.filename, n.title, n.storage_path, n.size_bytes, n.sha256, n.visible, n.like_count, n.comment_count, n.created_at, n.updated_at
+	q := `SELECT n.id, n.owner_user_id, COALESCE(u.username,''), n.filename, n.title, n.storage_path, n.cover_path, n.size_bytes, n.sha256, n.visible, n.public_download, n.like_count, n.comment_count, n.created_at, n.updated_at
 		FROM notes n LEFT JOIN users u ON u.id = n.owner_user_id`
 	if onlyVisible {
 		q += ` WHERE n.visible = 1`
@@ -297,6 +375,22 @@ func (s *Store) SetNoteVisible(ctx context.Context, id string, visible bool) err
 		v = 1
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE notes SET visible=?, updated_at=? WHERE id=?`, v, time.Now().UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) SetNotePublicDownload(ctx context.Context, id string, enabled bool) error {
+	v := 0
+	if enabled {
+		v = 1
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE notes SET public_download=?, updated_at=? WHERE id=?`, v, time.Now().UTC().Format(time.RFC3339Nano), id)
 	if err != nil {
 		return err
 	}
@@ -442,15 +536,43 @@ func (s *Store) GetDownloadToken(ctx context.Context, token string) (string, tim
 }
 
 func (s *Store) ConsumeDownloadToken(ctx context.Context, token string) (string, error) {
-	noteID, exp, err := s.GetDownloadToken(ctx, token)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
 	}
-	if time.Now().After(exp) {
-		_, _ = s.db.ExecContext(ctx, `DELETE FROM download_tokens WHERE token = ?`, token)
+	defer func() { _ = tx.Rollback() }()
+
+	var noteID, exp string
+	err = tx.QueryRowContext(ctx, `SELECT note_id, expires_at FROM download_tokens WHERE token = ?`, token).Scan(&noteID, &exp)
+	if err == sql.ErrNoRows {
 		return "", storage.ErrNotFound
 	}
+	if err != nil {
+		return "", err
+	}
+	expiresAt, _ := time.Parse(time.RFC3339Nano, exp)
+	if time.Now().After(expiresAt) {
+		_, _ = tx.ExecContext(ctx, `DELETE FROM download_tokens WHERE token = ?`, token)
+		_ = tx.Commit()
+		return "", storage.ErrNotFound
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM download_tokens WHERE token = ?`, token)
+	if err != nil {
+		return "", err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return "", storage.ErrNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
 	return noteID, nil
+}
+
+func (s *Store) DeleteExpiredDownloadTokens(ctx context.Context, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM download_tokens WHERE expires_at <= ?`, now.UTC().Format(time.RFC3339Nano))
+	return err
 }
 
 func (s *Store) GetGeoCache(ctx context.Context, ipHash string, maxAge time.Duration) (*storage.GeoInfo, error) {
@@ -498,6 +620,13 @@ func (s *Store) AddVisit(ctx context.Context, v storage.Visit) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO visits(id, ip_hash, path, note_id, country, region, city, lat, lng, user_agent, created_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 		v.ID, v.IPHash, v.Path, v.NoteID, v.Country, v.Region, v.City, lat, lng, v.UserAgent, v.CreatedAt)
+	return err
+}
+
+func (s *Store) BackfillVisitGeo(ctx context.Context, ipHash string, info storage.GeoInfo) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE visits SET country=?, region=?, city=?, lat=?, lng=?
+		WHERE ip_hash=? AND (lat IS NULL OR lng IS NULL OR country='' OR country IS NULL)`,
+		info.Country, info.Region, info.City, info.Lat, info.Lng, ipHash)
 	return err
 }
 

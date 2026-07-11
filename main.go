@@ -90,6 +90,8 @@ func main() {
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
 		BodyLimit:    int(cfg.MaxUploadBytes),
+		// Keep trailing slash distinct so /admin/{token}/ is not normalized into a redirect loop.
+		StrictRouting: true,
 	})
 	app.Use(cors.New(cors.Config{
 		AllowOriginsFunc: allowOriginFn,
