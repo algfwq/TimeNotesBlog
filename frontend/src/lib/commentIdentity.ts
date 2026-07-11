@@ -23,23 +23,25 @@ export function readCommentIdentity(): CommentIdentity | null {
     const raw = parseCookie(COOKIE_NAME);
     if (!raw) return null;
     const data = JSON.parse(raw) as Partial<CommentIdentity>;
-    const nickname = String(data.nickname || '').trim();
     const email = String(data.email || '').trim();
     const githubUrl = String(data.githubUrl || '').trim();
-    if (!nickname) return null;
-    if (!email && !githubUrl) return null;
-    if (email && !email.includes('@')) return null;
+    let nickname = String(data.nickname || '').trim();
     if (githubUrl) {
       try {
         const u = new URL(githubUrl);
         if (!['github.com', 'www.github.com'].includes(u.hostname.toLowerCase())) {
           return null;
         }
+        const user = u.pathname.split('/').filter(Boolean)[0] || '';
+        if (!user) return null;
+        if (!nickname) nickname = user;
+        return { nickname, email: '', githubUrl: `https://github.com/${user}` };
       } catch {
         return null;
       }
     }
-    return { nickname, email, githubUrl };
+    if (!nickname || !email || !email.includes('@')) return null;
+    return { nickname, email, githubUrl: '' };
   } catch {
     return null;
   }

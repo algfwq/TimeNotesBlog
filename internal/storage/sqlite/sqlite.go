@@ -516,58 +516,61 @@ func (s *Store) ResetLoginFailures(ctx context.Context, ipHash string) error {
 	return err
 }
 
-func (s *Store) CreateDownloadToken(ctx context.Context, token, noteID string, expiresAt time.Time) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO download_tokens(token, note_id, expires_at) VALUES(?,?,?)`,
-		token, noteID, expiresAt.UTC().Format(time.RFC3339Nano))
+func (s *Store) CreateDownloadToken(ctx context.Context, token, noteID, purpose string, expiresAt time.Time) error {
+	if strings.TrimSpace(purpose) == "" {
+		purpose = "read"
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO download_tokens(token, note_id, expires_at, purpose) VALUES(?,?,?,?)`,
+		token, noteID, expiresAt.UTC().Format(time.RFC3339Nano), purpose)
 	return err
 }
 
-func (s *Store) GetDownloadToken(ctx context.Context, token string) (string, time.Time, error) {
-	var noteID, exp string
-	err := s.db.QueryRowContext(ctx, `SELECT note_id, expires_at FROM download_tokens WHERE token = ?`, token).Scan(&noteID, &exp)
+func (s *Store) GetDownloadToken(ctx context.Context, token string) (string, string, time.Time, error) {
+	var noteID, exp, purpose string
+	err := s.db.QueryRowContext(ctx, `SELECT note_id, expires_at, COALESCE(purpose,'read') FROM download_tokens WHERE token = ?`, token).Scan(&noteID, &exp, &purpose)
 	if err == sql.ErrNoRows {
-		return "", time.Time{}, storage.ErrNotFound
+		return "", "", time.Time{}, storage.ErrNotFound
 	}
 	if err != nil {
-		return "", time.Time{}, err
+		return "", "", time.Time{}, err
 	}
 	t, _ := time.Parse(time.RFC3339Nano, exp)
-	return noteID, t, nil
+	return noteID, purpose, t, nil
 }
 
-func (s *Store) ConsumeDownloadToken(ctx context.Context, token string) (string, error) {
+func (s *Store) ConsumeDownloadToken(ctx context.Context, token string) (string, string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var noteID, exp string
-	err = tx.QueryRowContext(ctx, `SELECT note_id, expires_at FROM download_tokens WHERE token = ?`, token).Scan(&noteID, &exp)
+	var noteID, exp, purpose string
+	err = tx.QueryRowContext(ctx, `SELECT note_id, expires_at, COALESCE(purpose,'read') FROM download_tokens WHERE token = ?`, token).Scan(&noteID, &exp, &purpose)
 	if err == sql.ErrNoRows {
-		return "", storage.ErrNotFound
+		return "", "", storage.ErrNotFound
 	}
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	expiresAt, _ := time.Parse(time.RFC3339Nano, exp)
 	if time.Now().After(expiresAt) {
 		_, _ = tx.ExecContext(ctx, `DELETE FROM download_tokens WHERE token = ?`, token)
 		_ = tx.Commit()
-		return "", storage.ErrNotFound
+		return "", "", storage.ErrNotFound
 	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM download_tokens WHERE token = ?`, token)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return "", storage.ErrNotFound
+		return "", "", storage.ErrNotFound
 	}
 	if err := tx.Commit(); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return noteID, nil
+	return noteID, purpose, nil
 }
 
 func (s *Store) DeleteExpiredDownloadTokens(ctx context.Context, now time.Time) error {

@@ -99,14 +99,14 @@ func TestConsumeDownloadTokenIsOneTime(t *testing.T) {
 	if err := store.CreateNote(context.Background(), storage.Note{ID: "note", OwnerUserID: owner.ID, Filename: "note.tnote", Title: "note", StoragePath: "stored.tnote", SizeBytes: 1, SHA256: "sha", Visible: true, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CreateDownloadToken(context.Background(), "token", "note", time.Now().Add(time.Minute)); err != nil {
+	if err := store.CreateDownloadToken(context.Background(), "token", "note", "export", time.Now().Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	noteID, err := store.ConsumeDownloadToken(context.Background(), "token")
-	if err != nil || noteID != "note" {
-		t.Fatalf("first consume = %q, %v", noteID, err)
+	noteID, purpose, err := store.ConsumeDownloadToken(context.Background(), "token")
+	if err != nil || noteID != "note" || purpose != "export" {
+		t.Fatalf("first consume = %q/%q, %v", noteID, purpose, err)
 	}
-	if _, err := store.ConsumeDownloadToken(context.Background(), "token"); !errors.Is(err, storage.ErrNotFound) {
+	if _, _, err := store.ConsumeDownloadToken(context.Background(), "token"); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("second consume error = %v, want ErrNotFound", err)
 	}
 }

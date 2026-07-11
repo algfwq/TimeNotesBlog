@@ -7,33 +7,41 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"path/filepath"
 	"strings"
+
+	_ "golang.org/x/image/webp"
 )
 
 const (
-	defaultMaxArchiveEntries     = 2000
-	defaultMaxUncompressedTotal  = 512 * 1024 * 1024
-	defaultMaxUncompressedEntry  = 128 * 1024 * 1024
-	defaultMaxExpansionRatio     = 40
-	defaultMaxThumbnailPixels    = 4096 * 4096
-	defaultMaxJSONBytes          = 8 * 1024 * 1024
+	defaultMaxArchiveEntries    = 2000
+	defaultMaxUncompressedTotal = 512 * 1024 * 1024
+	defaultMaxUncompressedEntry = 128 * 1024 * 1024
+	defaultMaxExpansionRatio    = 40
+	defaultMaxThumbnailPixels   = 4096 * 4096
+	defaultMaxJSONBytes         = 8 * 1024 * 1024
 )
 
 type ArchiveLimits struct {
-	MaxEntries            int
-	MaxUncompressedTotal  int64
-	MaxUncompressedEntry  int64
-	MaxExpansionRatio     int64
-	MaxThumbnailPixels    int64
-	MaxJSONBytes          int64
+	MaxEntries           int
+	MaxUncompressedTotal int64
+	MaxUncompressedEntry int64
+	MaxExpansionRatio    int64
+	MaxThumbnailPixels   int64
+	MaxJSONBytes         int64
 }
 
 type ValidatedArchive struct {
-	Title         string
-	ThumbnailPNG  []byte
-	FormatVersion int
+	Title           string
+	ThumbnailBytes  []byte
+	ThumbnailExt    string // .png / .jpg / .webp / .gif
+	ThumbnailMIME   string
+	FormatVersion   int
 }
 
 func defaultArchiveLimits(maxUploadBytes int64) ArchiveLimits {
@@ -46,7 +54,6 @@ func defaultArchiveLimits(maxUploadBytes int64) ArchiveLimits {
 		MaxJSONBytes:         defaultMaxJSONBytes,
 	}
 	if maxUploadBytes > 0 {
-		// Keep total uncompressed bound proportional to configured upload size.
 		if maxUploadBytes*int64(defaultMaxExpansionRatio) < limits.MaxUncompressedTotal {
 			limits.MaxUncompressedTotal = maxUploadBytes * int64(defaultMaxExpansionRatio)
 		}
@@ -109,13 +116,16 @@ func ValidateTNoteArchive(path string, limits ArchiveLimits) (*ValidatedArchive,
 			return nil, errors.New("archive uncompressed size too large")
 		}
 		compressedTotal += int64(f.CompressedSize64)
-		switch name {
-		case "manifest.json":
+		switch {
+		case name == "manifest.json":
 			manifestFile = f
-		case "document.json":
+		case name == "document.json":
 			documentFile = f
-		case "thumbnail.png":
-			thumbFile = f
+		case isThumbnailEntry(name):
+			// Prefer the first thumbnail.* entry; later ones are ignored.
+			if thumbFile == nil {
+				thumbFile = f
+			}
 		}
 	}
 	if compressedTotal > 0 && uncompressedTotal/compressedTotal > limits.MaxExpansionRatio {
@@ -141,9 +151,10 @@ func ValidateTNoteArchive(path string, limits ArchiveLimits) (*ValidatedArchive,
 	}
 	thumbRaw, err := readZipFileLimited(thumbFile, limits.MaxUncompressedEntry)
 	if err != nil {
-		return nil, fmt.Errorf("read thumbnail.png: %w", err)
+		return nil, fmt.Errorf("read thumbnail: %w", err)
 	}
-	if err := validatePNGThumbnail(thumbRaw, limits.MaxThumbnailPixels); err != nil {
+	ext, mime, err := validateThumbnailImage(thumbRaw, limits.MaxThumbnailPixels)
+	if err != nil {
 		return nil, err
 	}
 
@@ -168,10 +179,22 @@ func ValidateTNoteArchive(path string, limits ArchiveLimits) (*ValidatedArchive,
 		version = manifest.FormatVersion
 	}
 	return &ValidatedArchive{
-		Title:         document.Title,
-		ThumbnailPNG:  thumbRaw,
-		FormatVersion: version,
+		Title:          document.Title,
+		ThumbnailBytes: thumbRaw,
+		ThumbnailExt:   ext,
+		ThumbnailMIME:  mime,
+		FormatVersion:  version,
 	}, nil
+}
+
+func isThumbnailEntry(name string) bool {
+	base := strings.ToLower(filepath.Base(name))
+	switch base {
+	case "thumbnail.png", "thumbnail.jpg", "thumbnail.jpeg", "thumbnail.webp", "thumbnail.gif":
+		return true
+	default:
+		return false
+	}
 }
 
 func safeArchiveName(name string) (string, error) {
@@ -203,25 +226,45 @@ func readZipFileLimited(f *zip.File, maxBytes int64) ([]byte, error) {
 	return data, nil
 }
 
-func validatePNGThumbnail(data []byte, maxPixels int64) error {
-	if len(data) < 24 {
-		return errors.New("thumbnail is not a valid PNG")
+func validateThumbnailImage(data []byte, maxPixels int64) (ext string, mime string, err error) {
+	if len(data) < 12 {
+		return "", "", errors.New("thumbnail is not a valid image")
 	}
-	signature := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
-	if !bytes.Equal(data[:8], signature) {
-		return errors.New("thumbnail is not a valid PNG")
+	// Fast signature checks first.
+	switch {
+	case bytes.HasPrefix(data, []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}):
+		ext, mime = ".png", "image/png"
+	case bytes.HasPrefix(data, []byte{0xFF, 0xD8, 0xFF}):
+		ext, mime = ".jpg", "image/jpeg"
+	case bytes.HasPrefix(data, []byte("GIF87a")) || bytes.HasPrefix(data, []byte("GIF89a")):
+		ext, mime = ".gif", "image/gif"
+	case len(data) >= 12 && string(data[0:4]) == "RIFF" && string(data[8:12]) == "WEBP":
+		ext, mime = ".webp", "image/webp"
+	default:
+		return "", "", errors.New("thumbnail must be png/jpg/webp/gif")
 	}
-	// IHDR length(4)+type(4)+width(4)+height(4)
-	if string(data[12:16]) != "IHDR" {
-		return errors.New("thumbnail missing IHDR")
+
+	cfg, _, decodeErr := image.DecodeConfig(bytes.NewReader(data))
+	if decodeErr != nil {
+		// PNG IHDR fallback for incomplete but signature-valid files.
+		if ext == ".png" && len(data) >= 24 && string(data[12:16]) == "IHDR" {
+			width := binary.BigEndian.Uint32(data[16:20])
+			height := binary.BigEndian.Uint32(data[20:24])
+			if width == 0 || height == 0 {
+				return "", "", errors.New("thumbnail has invalid dimensions")
+			}
+			if int64(width)*int64(height) > maxPixels {
+				return "", "", errors.New("thumbnail too large")
+			}
+			return ext, mime, nil
+		}
+		return "", "", fmt.Errorf("thumbnail is not a valid image: %w", decodeErr)
 	}
-	width := binary.BigEndian.Uint32(data[16:20])
-	height := binary.BigEndian.Uint32(data[20:24])
-	if width == 0 || height == 0 {
-		return errors.New("thumbnail has invalid dimensions")
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return "", "", errors.New("thumbnail has invalid dimensions")
 	}
-	if int64(width)*int64(height) > maxPixels {
-		return errors.New("thumbnail too large")
+	if int64(cfg.Width)*int64(cfg.Height) > maxPixels {
+		return "", "", errors.New("thumbnail too large")
 	}
-	return nil
+	return ext, mime, nil
 }

@@ -137,27 +137,27 @@ func (s *stubStore) BumpLoginFailure(ctx context.Context, ipHash string, now tim
 	return 1, nil
 }
 func (s *stubStore) ResetLoginFailures(ctx context.Context, ipHash string) error { return nil }
-func (s *stubStore) CreateDownloadToken(ctx context.Context, token, noteID string, expiresAt time.Time) error {
+func (s *stubStore) CreateDownloadToken(ctx context.Context, token, noteID, purpose string, expiresAt time.Time) error {
 	s.tokens[token] = struct {
 		noteID string
 		exp    time.Time
 	}{noteID: noteID, exp: expiresAt}
 	return nil
 }
-func (s *stubStore) ConsumeDownloadToken(ctx context.Context, token string) (string, error) {
+func (s *stubStore) ConsumeDownloadToken(ctx context.Context, token string) (string, string, error) {
 	item, ok := s.tokens[token]
 	if !ok || time.Now().After(item.exp) {
-		return "", storage.ErrNotFound
+		return "", "", storage.ErrNotFound
 	}
 	delete(s.tokens, token)
-	return item.noteID, nil
+	return item.noteID, "export", nil
 }
-func (s *stubStore) GetDownloadToken(ctx context.Context, token string) (string, time.Time, error) {
+func (s *stubStore) GetDownloadToken(ctx context.Context, token string) (string, string, time.Time, error) {
 	item, ok := s.tokens[token]
 	if !ok {
-		return "", time.Time{}, storage.ErrNotFound
+		return "", "", time.Time{}, storage.ErrNotFound
 	}
-	return item.noteID, item.exp, nil
+	return item.noteID, "export", item.exp, nil
 }
 func (s *stubStore) DeleteExpiredDownloadTokens(ctx context.Context, now time.Time) error {
 	return nil

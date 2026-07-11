@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"image"
+	"image/jpeg"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -43,6 +44,16 @@ func samplePNG(t *testing.T, w, h int) []byte {
 	return buf.Bytes()
 }
 
+func sampleJPEG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
 func validArchiveFiles(t *testing.T) map[string][]byte {
 	t.Helper()
 	return map[string][]byte{
@@ -59,8 +70,23 @@ func TestValidateTNoteArchiveAcceptsValidPackage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Title != "demo" || len(got.ThumbnailPNG) == 0 {
+	if got.Title != "demo" || len(got.ThumbnailBytes) == 0 || got.ThumbnailExt != ".png" {
 		t.Fatalf("unexpected result: %+v", got)
+	}
+}
+
+func TestValidateTNoteArchiveAcceptsJPEGThumbnail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jpg.tnote")
+	files := validArchiveFiles(t)
+	delete(files, "thumbnail.png")
+	files["thumbnail.jpg"] = sampleJPEG(t, 48, 48)
+	writeZip(t, path, files)
+	got, err := ValidateTNoteArchive(path, defaultArchiveLimits(10<<20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ThumbnailExt != ".jpg" || got.ThumbnailMIME != "image/jpeg" {
+		t.Fatalf("unexpected jpeg thumbnail meta: %+v", got)
 	}
 }
 
@@ -85,26 +111,24 @@ func TestValidateTNoteArchiveRequiresThumbnail(t *testing.T) {
 	}
 }
 
-func TestValidateTNoteArchiveRejectsFakePNG(t *testing.T) {
+func TestValidateTNoteArchiveRejectsFakeImage(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fake.tnote")
 	files := validArchiveFiles(t)
 	files["thumbnail.png"] = []byte("not-a-png")
 	writeZip(t, path, files)
 	if _, err := ValidateTNoteArchive(path, defaultArchiveLimits(10<<20)); err == nil {
-		t.Fatal("expected fake png rejection")
+		t.Fatal("expected fake image rejection")
 	}
 }
 
-func TestValidatePNGThumbnailRejectsHugeDimensions(t *testing.T) {
-	// Craft a minimal PNG header with absurd dimensions without allocating the image.
+func TestValidateThumbnailImageRejectsHugeDimensions(t *testing.T) {
 	var buf bytes.Buffer
 	buf.Write([]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A})
-	// length=13, type=IHDR
 	_ = binary.Write(&buf, binary.BigEndian, uint32(13))
 	buf.WriteString("IHDR")
 	_ = binary.Write(&buf, binary.BigEndian, uint32(100000))
 	_ = binary.Write(&buf, binary.BigEndian, uint32(100000))
-	if err := validatePNGThumbnail(buf.Bytes(), defaultMaxThumbnailPixels); err == nil {
+	if _, _, err := validateThumbnailImage(buf.Bytes(), defaultMaxThumbnailPixels); err == nil {
 		t.Fatal("expected oversized thumbnail rejection")
 	}
 }

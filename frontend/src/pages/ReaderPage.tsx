@@ -121,7 +121,11 @@ export function ReaderPage() {
         const p = payload as { noteId?: string; comment?: Comment; commentCount?: number };
         if (p.noteId !== id || !p.comment) return;
         setComments((prev) => (prev.some((c) => c.id === p.comment!.id) ? prev : [p.comment!, ...prev]));
-        setNote((n) => (n ? { ...n, commentCount: Number(p.commentCount ?? n.commentCount + 1) } : n));
+        setNote((n) => {
+          if (!n) return n;
+          const nextCount = Number(p.commentCount ?? n.commentCount);
+          return { ...n, commentCount: Math.max(n.commentCount || 0, nextCount) };
+        });
       }),
       blogWS.on('event.note.deleted', (payload) => {
         const p = payload as { id?: string };
@@ -175,9 +179,19 @@ export function ReaderPage() {
         githubUrl: who.githubUrl,
         content,
       });
-      setComments((prev) => [res.comment, ...prev]);
+      // Insert by id only once. Realtime event may also arrive; both paths dedupe on id.
+      let inserted = false;
+      setComments((prev) => {
+        if (prev.some((c) => c.id === res.comment.id)) {
+          return prev;
+        }
+        inserted = true;
+        return [res.comment, ...prev];
+      });
       setContent('');
-      setNote((n) => (n ? { ...n, commentCount: (n.commentCount || 0) + 1 } : n));
+      if (inserted) {
+        setNote((n) => (n ? { ...n, commentCount: (n.commentCount || 0) + 1 } : n));
+      }
       Toast.success('评论已发布');
     } catch (e) {
       Toast.error(String(e));
@@ -232,9 +246,9 @@ export function ReaderPage() {
               theme="light"
               onClick={async () => {
                 try {
-                  // Re-issue a fresh one-time token for the explicit download action.
-                  const res = await blogWS.request<NoteGetResponse>('notes.get', { id });
-                  const url = res.note.downloadUrl || '';
+                  // Re-issue a fresh one-time export token for the explicit download action.
+                  const res = await blogWS.request<NoteGetResponse & { exportUrl?: string }>('notes.get', { id });
+                  const url = res.exportUrl || '';
                   if (!url) {
                     throw new Error('download unavailable');
                   }

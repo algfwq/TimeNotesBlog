@@ -667,10 +667,13 @@ func (cs *clientSession) handleNotesList(ctx context.Context, env protocol.Envel
 	cs.replyOK(protocol.TypeNotesList, env.ID, map[string]any{"notes": out})
 }
 
-func (cs *clientSession) issueDownloadURL(ctx context.Context, noteID string) (string, error) {
+func (cs *clientSession) issueDownloadURL(ctx context.Context, noteID, purpose string) (string, error) {
+	if strings.TrimSpace(purpose) == "" {
+		purpose = "read"
+	}
 	token := protocol.NewToken(24)
 	exp := time.Now().Add(10 * time.Minute)
-	if err := cs.hub.store.CreateDownloadToken(ctx, token, noteID, exp); err != nil {
+	if err := cs.hub.store.CreateDownloadToken(ctx, token, noteID, purpose, exp); err != nil {
 		return "", err
 	}
 	return "/files/" + token, nil
@@ -715,19 +718,33 @@ func (cs *clientSession) handleNotesGet(ctx context.Context, env protocol.Envelo
 		}
 	}
 	note.CoverURL = noteCoverURL(note)
-	// Reading always needs a short-lived file URL for visible notes. The dedicated
-	// public "download" button is gated by publicDownload (or owner/admin rights).
-	urlPath, err := cs.issueDownloadURL(ctx, note.ID)
+	// Reading always uses a short-lived "read" token for in-app rendering.
+	// Explicit downloads use export/export_auth tokens and are enforced in handleDownload.
+	readURL, err := cs.issueDownloadURL(ctx, note.ID, "read")
 	if err != nil {
 		cs.replyErr(env.ID, "token_error", "failed to issue download")
 		return
 	}
-	note.DownloadURL = urlPath
+	note.DownloadURL = readURL
+	canDownload := cs.canDownloadNote(ctx, note)
+	exportURL := ""
+	if canDownload {
+		purpose := "export"
+		if u, err := cs.requireCurrentUser(ctx); err == nil && (u.Role == "admin" || u.ID == note.OwnerUserID) {
+			purpose = "export_auth"
+		}
+		exportURL, err = cs.issueDownloadURL(ctx, note.ID, purpose)
+		if err != nil {
+			cs.replyErr(env.ID, "token_error", "failed to issue download")
+			return
+		}
+	}
 	liked, _ := cs.hub.store.HasLiked(ctx, note.ID, cs.ipHash)
 	cs.replyOK(protocol.TypeNotesGet, env.ID, map[string]any{
-		"note":           note,
-		"liked":          liked,
-		"canDownload":    cs.canDownloadNote(ctx, note),
+		"note":        note,
+		"liked":       liked,
+		"canDownload": canDownload,
+		"exportUrl":   exportURL,
 	})
 }
 
@@ -983,7 +1000,11 @@ func (cs *clientSession) handleUploadFinish(ctx context.Context, env protocol.En
 	}
 	finalName := noteID + ".tnote"
 	finalPath := filepath.Join(cs.hub.opts.NotesDir, finalName)
-	coverPath := filepath.Join(cs.hub.opts.CoversDir, noteID+".png")
+	coverExt := validated.ThumbnailExt
+	if coverExt == "" {
+		coverExt = ".png"
+	}
+	coverPath := filepath.Join(cs.hub.opts.CoversDir, noteID+coverExt)
 	tmpFinal := finalPath + ".new"
 	tmpCover := coverPath + ".new"
 	if err := copyFile(st.TmpPath, tmpFinal); err != nil {
@@ -991,7 +1012,7 @@ func (cs *clientSession) handleUploadFinish(ctx context.Context, env protocol.En
 		cs.replyErr(env.ID, "io_error", "finalize failed")
 		return
 	}
-	if err := os.WriteFile(tmpCover, validated.ThumbnailPNG, 0o644); err != nil {
+	if err := os.WriteFile(tmpCover, validated.ThumbnailBytes, 0o644); err != nil {
 		_ = os.Remove(st.TmpPath)
 		_ = os.Remove(tmpFinal)
 		cs.replyErr(env.ID, "io_error", "cover write failed")
@@ -1409,7 +1430,7 @@ func (cs *clientSession) handleAdminNotesList(ctx context.Context, env protocol.
 			cs.replyErr(env.ID, "not_found", "note not found")
 			return
 		}
-		urlPath, err := cs.issueDownloadURL(ctx, note.ID)
+		urlPath, err := cs.issueDownloadURL(ctx, note.ID, "export_auth")
 		if err != nil {
 			cs.replyErr(env.ID, "token_error", "failed to issue download")
 			return
@@ -1742,7 +1763,7 @@ u.PasswordHash = ""
 		if token == "" {
 			return fiber.ErrNotFound
 		}
-		noteID, err := h.store.ConsumeDownloadToken(c.Context(), token)
+		noteID, purpose, err := h.store.ConsumeDownloadToken(c.Context(), token)
 		if err != nil {
 			return fiber.ErrNotFound
 		}
@@ -1750,12 +1771,34 @@ u.PasswordHash = ""
 		if err != nil {
 			return fiber.ErrNotFound
 		}
+		switch purpose {
+		case "export":
+			// Public export is only valid when the note is visible and public download is enabled.
+			if !note.Visible || !note.PublicDownload {
+				return fiber.ErrNotFound
+			}
+		case "export_auth":
+			// Auth-scoped export tokens (admin/owner) may download even if public download is off.
+		case "read":
+			// Read tokens are for in-app rendering of visible notes (or hidden notes for admins who received the token).
+			if !note.Visible {
+				return fiber.ErrNotFound
+			}
+		default:
+			return fiber.ErrNotFound
+		}
 		filename := safeFilename(note.Filename)
 		if filename == "" {
 			filename = note.ID + ".tnote"
 		}
+		disposition := "inline"
+		if purpose == "export" || purpose == "export_auth" {
+			disposition = "attachment"
+		}
 		c.Set("Content-Type", "application/octet-stream")
-		c.Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, strings.ReplaceAll(filename, `"`, "")))
+		c.Set("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, disposition, strings.ReplaceAll(filename, `"`, "")))
+		c.Set("X-Content-Type-Options", "nosniff")
+		c.Set("Cache-Control", "no-store")
 		return c.SendFile(note.StoragePath)
 	}
 
@@ -1775,7 +1818,16 @@ u.PasswordHash = ""
 		if strings.TrimSpace(note.CoverPath) == "" {
 			return fiber.ErrNotFound
 		}
-		c.Set("Content-Type", "image/png")
+		switch strings.ToLower(filepath.Ext(note.CoverPath)) {
+		case ".jpg", ".jpeg":
+			c.Set("Content-Type", "image/jpeg")
+		case ".webp":
+			c.Set("Content-Type", "image/webp")
+		case ".gif":
+			c.Set("Content-Type", "image/gif")
+		default:
+			c.Set("Content-Type", "image/png")
+		}
 		c.Set("Cache-Control", "public, max-age=3600")
 		return c.SendFile(note.CoverPath)
 	}

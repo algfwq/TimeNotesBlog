@@ -144,9 +144,9 @@ type Store interface {
 	BumpLoginFailure(ctx context.Context, ipHash string, now time.Time) (count int, err error)
 	ResetLoginFailures(ctx context.Context, ipHash string) error
 
-	CreateDownloadToken(ctx context.Context, token, noteID string, expiresAt time.Time) error
-	ConsumeDownloadToken(ctx context.Context, token string) (noteID string, err error)
-	GetDownloadToken(ctx context.Context, token string) (noteID string, expiresAt time.Time, err error)
+	CreateDownloadToken(ctx context.Context, token, noteID, purpose string, expiresAt time.Time) error
+	ConsumeDownloadToken(ctx context.Context, token string) (noteID string, purpose string, err error)
+	GetDownloadToken(ctx context.Context, token string) (noteID string, purpose string, expiresAt time.Time, err error)
 	DeleteExpiredDownloadTokens(ctx context.Context, now time.Time) error
 
 	GetGeoCache(ctx context.Context, ipHash string, maxAge time.Duration) (*GeoInfo, error)
