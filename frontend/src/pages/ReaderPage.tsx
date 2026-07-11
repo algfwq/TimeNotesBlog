@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Button, SideSheet, Spin, TextArea, Toast, Typography } from '@douyinfe/semi-ui';
 import { IconArrowLeft, IconComment, IconDownload, IconLikeThumb } from '@douyinfe/semi-icons';
 import { blogWS } from '../lib/wsClient';
-import { loadTNoteFromUrl, type NoteDocument } from '../lib/tnote';
+import { loadTNoteFromUrl, releaseTNoteObjectUrls, type LoadedTNote } from '../lib/tnote';
 import { ReaderView } from '../components/ReaderView';
 import { CommentIdentityModal } from '../components/CommentIdentityModal';
 import { readCommentIdentity, writeCommentIdentity, type CommentIdentity } from '../lib/commentIdentity';
@@ -17,6 +17,7 @@ type Note = {
   downloadUrl?: string;
   publicDownload?: boolean;
   coverUrl?: string;
+  visible?: boolean;
 };
 
 type NoteGetResponse = {
@@ -60,7 +61,7 @@ export function ReaderPage() {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(true);
   const [note, setNote] = useState<Note | null>(null);
-  const [doc, setDoc] = useState<NoteDocument | null>(null);
+  const [loaded, setLoaded] = useState<LoadedTNote | null>(null);
   const [liked, setLiked] = useState(false);
   const [comments, setComments] = useState<Comment[]>([]);
   const [sheetOpen, setSheetOpen] = useState(false);
@@ -69,6 +70,14 @@ export function ReaderPage() {
   const [identityOpen, setIdentityOpen] = useState(false);
   const [identity, setIdentity] = useState<CommentIdentity | null>(() => readCommentIdentity());
   const [canDownload, setCanDownload] = useState(false);
+  const [unavailable, setUnavailable] = useState('');
+  const objectUrlsRef = useRef<string[]>([]);
+
+  const replaceLoaded = (next: LoadedTNote | null) => {
+    releaseTNoteObjectUrls(objectUrlsRef.current);
+    objectUrlsRef.current = next?.objectUrls ?? [];
+    setLoaded(next);
+  };
 
   const loadAll = async () => {
     await blogWS.connect();
@@ -76,13 +85,14 @@ export function ReaderPage() {
     setNote(res.note);
     setLiked(Boolean(res.liked));
     setCanDownload(Boolean(res.canDownload));
+    setUnavailable('');
     const url = res.note.downloadUrl || '';
     if (url) {
       const absolute = url.startsWith('http') ? url : `${location.origin}${url}`;
-      const loaded = await loadTNoteFromUrl(absolute);
-      setDoc(loaded);
+      const next = await loadTNoteFromUrl(absolute);
+      replaceLoaded(next);
     } else {
-      setDoc(null);
+      replaceLoaded(null);
     }
     const cl = await blogWS.request<{ comments: Comment[] }>('notes.comments.list', { id });
     setComments(cl.comments || []);
@@ -106,6 +116,8 @@ export function ReaderPage() {
     })();
     return () => {
       cancelled = true;
+      releaseTNoteObjectUrls(objectUrlsRef.current);
+      objectUrlsRef.current = [];
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
@@ -130,13 +142,23 @@ export function ReaderPage() {
       blogWS.on('event.note.deleted', (payload) => {
         const p = payload as { id?: string };
         if (p.id !== id) return;
+        setUnavailable('该手账已被删除');
         Toast.warning('该手账已不可用');
-        navigate('/');
+        window.setTimeout(() => navigate('/'), 1200);
       }),
       blogWS.on('event.note.changed', (payload) => {
         const p = payload as { note?: Note };
         if (!p.note || p.note.id !== id) return;
+        if (p.note.visible === false) {
+          setUnavailable('该手账已隐藏');
+          Toast.warning('该手账已不可用');
+          window.setTimeout(() => navigate('/'), 1200);
+          return;
+        }
         setNote((n) => (n ? { ...n, ...p.note } : p.note || n));
+        if (p.note.publicDownload !== undefined) {
+          setCanDownload(Boolean(p.note.publicDownload));
+        }
       }),
       blogWS.onSnapshot(async () => {
         try {
@@ -152,7 +174,7 @@ export function ReaderPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, navigate]);
 
-  const title = useMemo(() => note?.title || doc?.title || '手账', [note, doc]);
+  const title = useMemo(() => note?.title || loaded?.document.title || '手账', [note, loaded]);
 
   const onLike = async () => {
     if (liked) {
@@ -179,7 +201,6 @@ export function ReaderPage() {
         githubUrl: who.githubUrl,
         content,
       });
-      // Insert by id only once. Realtime event may also arrive; both paths dedupe on id.
       let inserted = false;
       setComments((prev) => {
         if (prev.some((c) => c.id === res.comment.id)) {
@@ -221,6 +242,17 @@ export function ReaderPage() {
     );
   }
 
+  if (unavailable) {
+    return (
+      <div className="page-shell">
+        <div className="glass" style={{ borderRadius: 16, padding: 28, textAlign: 'center' }}>
+          <Typography.Title heading={4} style={{ marginTop: 0 }}>{unavailable}</Typography.Title>
+          <Button theme="solid" type="primary" onClick={() => navigate('/')}>返回首页</Button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="page-shell">
       <div className="glass" style={{ borderRadius: 18, padding: 16, marginBottom: 18, display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
@@ -246,7 +278,6 @@ export function ReaderPage() {
               theme="light"
               onClick={async () => {
                 try {
-                  // Re-issue a fresh one-time export token for the explicit download action.
                   const res = await blogWS.request<NoteGetResponse & { exportUrl?: string }>('notes.get', { id });
                   const url = res.exportUrl || '';
                   if (!url) {
@@ -264,7 +295,7 @@ export function ReaderPage() {
         </div>
       </div>
 
-      {doc ? <ReaderView document={doc} /> : (
+      {loaded?.document ? <ReaderView document={loaded.document} /> : (
         <div className="glass" style={{ borderRadius: 16, padding: 24 }}>无法加载手账内容</div>
       )}
 
