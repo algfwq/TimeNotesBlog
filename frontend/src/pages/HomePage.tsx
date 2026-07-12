@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Empty, Spin, Typography } from '@douyinfe/semi-ui';
+import { Button, Empty, Spin, Typography } from '@douyinfe/semi-ui';
 import { IconBook, IconComment, IconDownload, IconLikeThumb } from '@douyinfe/semi-icons';
 import { blogWS } from '../lib/wsClient';
 import { PublicNav } from '../components/PublicNav';
@@ -40,18 +40,27 @@ export function HomePage() {
   const [error, setError] = useState('');
   const [brokenCovers, setBrokenCovers] = useState<Record<string, boolean>>({});
   const [scrolledPastHero, setScrolledPastHero] = useState(false);
+  const [notesTotal, setNotesTotal] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
   const restoredScrollRef = useRef(false);
   const navigate = useNavigate();
+  const pageSize = 24;
 
   const openNote = (id: string) => {
     rememberHomeScroll(id);
     navigate(`/note/${id}`);
   };
 
-  const loadNotes = async () => {
+  const loadNotes = async (append = false) => {
     await blogWS.connect();
-    const res = await blogWS.request<{ notes: Note[] }>('notes.list', {});
-    setNotes(res.notes || []);
+    const offset = append ? notes.length : 0;
+    const res = await blogWS.request<{ notes: Note[]; total?: number }>('notes.list', {
+      limit: pageSize,
+      offset,
+    });
+    const batch = res.notes || [];
+    setNotes((prev) => (append ? [...prev, ...batch.filter((n) => !prev.some((p) => p.id === n.id))] : batch));
+    setNotesTotal(Number(res.total ?? batch.length));
   };
 
   const loadSettings = async () => {
@@ -224,7 +233,7 @@ export function HomePage() {
       <section id="notes-grid" className="home-grid-section">
         <div className="home-grid-header">
           <Typography.Title heading={3} style={{ margin: 0 }}>手账本</Typography.Title>
-          <Typography.Text type="tertiary">{notes.length} 本公开</Typography.Text>
+          <Typography.Text type="tertiary">{notesTotal || notes.length} 本公开</Typography.Text>
         </div>
 
         {loading ? (
@@ -290,6 +299,20 @@ export function HomePage() {
             })}
           </div>
         )}
+        {!loading && !error && notes.length > 0 && notes.length < notesTotal ? (
+          <div style={{ display: 'flex', justifyContent: 'center', marginTop: 20 }}>
+            <Button
+              theme="light"
+              loading={loadingMore}
+              onClick={() => {
+                setLoadingMore(true);
+                void loadNotes(true).finally(() => setLoadingMore(false));
+              }}
+            >
+              加载更多
+            </Button>
+          </div>
+        ) : null}
       </section>
     </div>
   );

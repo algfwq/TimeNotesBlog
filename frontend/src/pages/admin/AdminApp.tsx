@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   Button, Checkbox, ColorPicker, Empty, Input, Modal, Progress, Select, Slider, Switch, Tag,
   Table, Toast, Typography, Upload,
@@ -101,6 +101,12 @@ export function AdminApp() {
   const [selfSaving, setSelfSaving] = useState(false);
   const [powProgress, setPowProgress] = useState<PowProgress | null>(null);
   const [uploadingHero, setUploadingHero] = useState(false);
+  const [notesTotal, setNotesTotal] = useState(0);
+  const [usersTotal, setUsersTotal] = useState(0);
+  const [notesPage, setNotesPage] = useState(1);
+  const [usersPage, setUsersPage] = useState(1);
+  const pageSize = 20;
+  const statsTimerRef = useRef<number | null>(null);
 
   const mapError = (e: unknown) => {
     const msg = String(e);
@@ -182,19 +188,54 @@ export function AdminApp() {
     }
   };
 
+  const refreshNotes = async (page = notesPage) => {
+    const offset = (page - 1) * pageSize;
+    const n = await blogWS.request<{ notes: Note[]; total?: number }>('admin.notes.list', { limit: pageSize, offset });
+    setNotes(n.notes || []);
+    setNotesTotal(Number(n.total ?? (n.notes || []).length));
+    setNotesPage(page);
+  };
+
+  const refreshUsers = async (page = usersPage) => {
+    const offset = (page - 1) * pageSize;
+    const u = await blogWS.request<{ users: User[]; total?: number }>('admin.users.list', { limit: pageSize, offset });
+    setUsers(u.users || []);
+    setUsersTotal(Number(u.total ?? (u.users || []).length));
+    setUsersPage(page);
+  };
+
+  const refreshStats = async () => {
+    const s = await blogWS.request<Stats>('admin.stats', {});
+    setStats(s);
+  };
+
   const refreshAll = async () => {
     const [u, n, s, site] = await Promise.all([
-      blogWS.request<{ users: User[] }>('admin.users.list', {}),
-      blogWS.request<{ notes: Note[] }>('admin.notes.list', {}),
+      blogWS.request<{ users: User[]; total?: number }>('admin.users.list', { limit: pageSize, offset: 0 }),
+      blogWS.request<{ notes: Note[]; total?: number }>('admin.notes.list', { limit: pageSize, offset: 0 }),
       blogWS.request<Stats>('admin.stats', {}),
       blogWS.request<{ settings: SiteSettings }>('admin.site.get', {}).catch(() => ({ settings: defaultSiteSettings() })),
     ]);
     setUsers(u.users || []);
+    setUsersTotal(Number(u.total ?? (u.users || []).length));
+    setUsersPage(1);
     setNotes(n.notes || []);
+    setNotesTotal(Number(n.total ?? (n.notes || []).length));
+    setNotesPage(1);
     setStats(s);
     const next = { ...defaultSiteSettings(), ...(site.settings || {}) };
     setSettings(next);
     setSettingsDraft(next);
+  };
+
+  const scheduleStatsRefresh = () => {
+    if (statsTimerRef.current != null) {
+      window.clearTimeout(statsTimerRef.current);
+    }
+    statsTimerRef.current = window.setTimeout(() => {
+      statsTimerRef.current = null;
+      void refreshStats().catch(() => undefined);
+    }, 800);
   };
 
   useEffect(() => {
@@ -205,12 +246,42 @@ export function AdminApp() {
   useEffect(() => {
     if (!authed || mustChange) return;
     const unsubs = [
-      blogWS.on('event.note.changed', () => { void refreshAll(); }),
-      blogWS.on('event.note.deleted', () => { void refreshAll(); }),
-      blogWS.on('event.user.changed', () => { void refreshAll(); }),
-      blogWS.on('event.stats.changed', () => { void refreshAll(); }),
-      blogWS.on('event.like.changed', () => { void refreshAll(); }),
-      blogWS.on('event.comment.created', () => { void refreshAll(); }),
+      blogWS.on('event.note.changed', () => { void refreshNotes(); void refreshStats(); }),
+      blogWS.on('event.note.deleted', () => { void refreshNotes(); void refreshStats(); }),
+      blogWS.on('event.user.changed', () => { void refreshUsers(); }),
+      blogWS.on('event.stats.changed', () => { scheduleStatsRefresh(); }),
+      blogWS.on('event.like.changed', (payload) => {
+        const p = payload as { noteId?: string; likeCount?: number };
+        if (!p.noteId) return;
+        setNotes((prev) => prev.map((n) => (n.id === p.noteId ? { ...n, likeCount: Number(p.likeCount ?? n.likeCount) } : n)));
+        setStats((s) => {
+          if (!s) return s;
+          return {
+            ...s,
+            noteStats: (s.noteStats || []).map((ns) => (
+              ns.noteId === p.noteId ? { ...ns, likeCount: Number(p.likeCount ?? ns.likeCount) } : ns
+            )),
+          };
+        });
+      }),
+      blogWS.on('event.comment.created', (payload) => {
+        const p = payload as { noteId?: string; commentCount?: number };
+        if (!p.noteId) return;
+        setNotes((prev) => prev.map((n) => (
+          n.id === p.noteId ? { ...n, commentCount: Math.max(n.commentCount, Number(p.commentCount ?? n.commentCount)) } : n
+        )));
+        setStats((s) => {
+          if (!s) return s;
+          return {
+            ...s,
+            noteStats: (s.noteStats || []).map((ns) => (
+              ns.noteId === p.noteId
+                ? { ...ns, commentCount: Math.max(ns.commentCount, Number(p.commentCount ?? ns.commentCount)) }
+                : ns
+            )),
+          };
+        });
+      }),
       blogWS.on('event.site-settings.changed', (payload) => {
         const p = payload as { settings?: SiteSettings };
         if (p.settings) {
@@ -221,7 +292,12 @@ export function AdminApp() {
       }),
       blogWS.onSnapshot(async () => { if (authed && !mustChange) await refreshAll(); }),
     ];
-    return () => unsubs.forEach((u) => u());
+    return () => {
+      unsubs.forEach((u) => u());
+      if (statsTimerRef.current != null) {
+        window.clearTimeout(statsTimerRef.current);
+      }
+    };
   }, [authed, mustChange]);
 
   const migrateCredentials = async (name: string, pass: string) => {
@@ -793,6 +869,12 @@ export function AdminApp() {
                     dataSource={notes}
                     rowKey="id"
                     empty={<Empty description="暂无手账" />}
+                    pagination={{
+                      currentPage: notesPage,
+                      pageSize,
+                      total: notesTotal,
+                      onPageChange: (p) => { void refreshNotes(p); },
+                    }}
                     columns={[
                       {
                         title: '手账',
@@ -900,6 +982,12 @@ export function AdminApp() {
                     dataSource={users}
                     rowKey="id"
                     empty={<Empty description="暂无用户" />}
+                    pagination={{
+                      currentPage: usersPage,
+                      pageSize,
+                      total: usersTotal,
+                      onPageChange: (p) => { void refreshUsers(p); },
+                    }}
                     columns={[
                       {
                         title: '用户',

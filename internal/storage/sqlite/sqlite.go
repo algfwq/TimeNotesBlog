@@ -91,8 +91,8 @@ func (s *Store) EnsureAdmin(ctx context.Context, username, passwordHash string) 
 		return false, nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO users(id, username, password_hash, role, can_upload, must_change_credentials, created_at, updated_at)
-		VALUES(?, ?, ?, 'admin', 1, 1, ?, ?)`, "admin", username, passwordHash, now, now)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO users(id, username, password_hash, role, can_upload, must_change_credentials, credentials_version, created_at, updated_at)
+		VALUES(?, ?, ?, 'admin', 1, 1, 0, ?, ?)`, "admin", username, passwordHash, now, now)
 	return err == nil, err
 }
 
@@ -117,9 +117,9 @@ func (s *Store) CreateUser(ctx context.Context, user storage.User) error {
 	if user.MustChangeCredentials {
 		mustChange = 1
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO users(id, username, password_hash, role, can_upload, must_change_credentials, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-		user.ID, user.Username, user.PasswordHash, user.Role, can, mustChange, user.CreatedAt, user.UpdatedAt)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO users(id, username, password_hash, role, can_upload, must_change_credentials, credentials_version, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		user.ID, user.Username, user.PasswordHash, user.Role, can, mustChange, user.CredentialsVersion, user.CreatedAt, user.UpdatedAt)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "unique") {
 		return storage.ErrConflict
 	}
@@ -129,7 +129,7 @@ func (s *Store) CreateUser(ctx context.Context, user storage.User) error {
 func scanUser(row interface{ Scan(dest ...any) error }) (*storage.User, error) {
 	var u storage.User
 	var can, mustChange int
-	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &can, &mustChange, &u.CreatedAt, &u.UpdatedAt); err != nil {
+	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &can, &mustChange, &u.CredentialsVersion, &u.CreatedAt, &u.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, storage.ErrNotFound
 		}
@@ -140,18 +140,20 @@ func scanUser(row interface{ Scan(dest ...any) error }) (*storage.User, error) {
 	return &u, nil
 }
 
+const userSelectCols = `id, username, password_hash, role, can_upload, must_change_credentials, COALESCE(credentials_version,0), created_at, updated_at`
+
 func (s *Store) GetUserByUsername(ctx context.Context, username string) (*storage.User, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, username, password_hash, role, can_upload, must_change_credentials, created_at, updated_at FROM users WHERE username = ?`, username)
+	row := s.db.QueryRowContext(ctx, `SELECT `+userSelectCols+` FROM users WHERE username = ?`, username)
 	return scanUser(row)
 }
 
 func (s *Store) GetUserByID(ctx context.Context, id string) (*storage.User, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, username, password_hash, role, can_upload, must_change_credentials, created_at, updated_at FROM users WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT `+userSelectCols+` FROM users WHERE id = ?`, id)
 	return scanUser(row)
 }
 
 func (s *Store) ListUsers(ctx context.Context) ([]storage.User, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, username, password_hash, role, can_upload, must_change_credentials, created_at, updated_at FROM users ORDER BY created_at ASC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+userSelectCols+` FROM users ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +169,36 @@ func (s *Store) ListUsers(ctx context.Context) ([]storage.User, error) {
 	return out, rows.Err()
 }
 
+func (s *Store) ListUsersPage(ctx context.Context, limit, offset int) ([]storage.User, int64, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var total int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM users`).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+userSelectCols+` FROM users ORDER BY created_at ASC LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []storage.User
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, *u)
+	}
+	return out, total, rows.Err()
+}
+
 func (s *Store) UpdateUser(ctx context.Context, user storage.User) error {
 	can := 0
 	if user.CanUpload {
@@ -176,8 +208,8 @@ func (s *Store) UpdateUser(ctx context.Context, user storage.User) error {
 	if user.MustChangeCredentials {
 		mustChange = 1
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE users SET username=?, password_hash=?, role=?, can_upload=?, must_change_credentials=?, updated_at=? WHERE id=?`,
-		user.Username, user.PasswordHash, user.Role, can, mustChange, user.UpdatedAt, user.ID)
+	res, err := s.db.ExecContext(ctx, `UPDATE users SET username=?, password_hash=?, role=?, can_upload=?, must_change_credentials=?, credentials_version=?, updated_at=? WHERE id=?`,
+		user.Username, user.PasswordHash, user.Role, can, mustChange, user.CredentialsVersion, user.UpdatedAt, user.ID)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return storage.ErrConflict
@@ -370,6 +402,46 @@ func (s *Store) ListAllNotes(ctx context.Context) ([]storage.Note, error) {
 	return s.listNotes(ctx, false)
 }
 
+func (s *Store) ListNotesPage(ctx context.Context, visibleOnly bool, limit, offset int) ([]storage.Note, int64, error) {
+	if limit <= 0 {
+		limit = 24
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	countQ := `SELECT COUNT(1) FROM notes`
+	if visibleOnly {
+		countQ += ` WHERE visible = 1`
+	}
+	var total int64
+	if err := s.db.QueryRowContext(ctx, countQ).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	q := `SELECT n.id, n.owner_user_id, COALESCE(u.username,''), n.filename, n.title, n.storage_path, n.cover_path, n.size_bytes, n.sha256, n.visible, n.public_download, n.like_count, n.comment_count, n.created_at, n.updated_at
+		FROM notes n LEFT JOIN users u ON u.id = n.owner_user_id`
+	if visibleOnly {
+		q += ` WHERE n.visible = 1`
+	}
+	q += ` ORDER BY n.updated_at DESC, n.id DESC LIMIT ? OFFSET ?`
+	rows, err := s.db.QueryContext(ctx, q, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []storage.Note
+	for rows.Next() {
+		n, err := scanNote(rows, true)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, *n)
+	}
+	return out, total, rows.Err()
+}
+
 func (s *Store) SetNoteVisible(ctx context.Context, id string, visible bool) error {
 	v := 0
 	if visible {
@@ -479,6 +551,47 @@ func (s *Store) ListComments(ctx context.Context, noteID string) ([]storage.Comm
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) ListCommentsPage(ctx context.Context, noteID string, limit int, beforeCreatedAt, beforeID string) ([]storage.Comment, bool, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	// Fetch limit+1 to detect hasMore.
+	fetch := limit + 1
+	var rows *sql.Rows
+	var err error
+	if strings.TrimSpace(beforeCreatedAt) != "" && strings.TrimSpace(beforeID) != "" {
+		rows, err = s.db.QueryContext(ctx, `SELECT id, note_id, nickname, email, github_url, content, created_at FROM comments
+			WHERE note_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+			ORDER BY created_at DESC, id DESC LIMIT ?`, noteID, beforeCreatedAt, beforeCreatedAt, beforeID, fetch)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `SELECT id, note_id, nickname, email, github_url, content, created_at FROM comments
+			WHERE note_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`, noteID, fetch)
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	var out []storage.Comment
+	for rows.Next() {
+		var c storage.Comment
+		if err := rows.Scan(&c.ID, &c.NoteID, &c.Nickname, &c.Email, &c.GitHubURL, &c.Content, &c.CreatedAt); err != nil {
+			return nil, false, err
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
 }
 
 func (s *Store) GetLoginFailures(ctx context.Context, ipHash string) (int, time.Time, error) {
@@ -639,18 +752,21 @@ func (s *Store) GetVisitStats(ctx context.Context, recentDays int) (*storage.Vis
 		recentDays = 14
 	}
 	now := time.Now().UTC()
-	today := now.Format("2006-01-02")
-	since := now.AddDate(0, 0, -recentDays+1).Format("2006-01-02")
+	// RFC3339 text sorts lexicographically; range predicates use the visits(created_at) index.
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).Format(time.RFC3339Nano)
+	tomorrowStart := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339Nano)
+	sinceStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).
+		AddDate(0, 0, -recentDays+1).Format(time.RFC3339Nano)
 
 	stats := &storage.VisitStats{}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM visits WHERE substr(created_at,1,10) = ?`, today).Scan(&stats.TodayCount); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM visits WHERE created_at >= ? AND created_at < ?`, todayStart, tomorrowStart).Scan(&stats.TodayCount); err != nil {
 		return nil, err
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM visits WHERE substr(created_at,1,10) >= ?`, since).Scan(&stats.RecentCount); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM visits WHERE created_at >= ?`, sinceStart).Scan(&stats.RecentCount); err != nil {
 		return nil, err
 	}
 
-	rows, err := s.db.QueryContext(ctx, `SELECT substr(created_at,1,10) AS d, COUNT(1) FROM visits WHERE substr(created_at,1,10) >= ? GROUP BY d ORDER BY d ASC`, since)
+	rows, err := s.db.QueryContext(ctx, `SELECT substr(created_at,1,10) AS d, COUNT(1) FROM visits WHERE created_at >= ? GROUP BY d ORDER BY d ASC`, sinceStart)
 	if err != nil {
 		return nil, err
 	}
@@ -665,8 +781,8 @@ func (s *Store) GetVisitStats(ctx context.Context, recentDays int) (*storage.Vis
 	rows.Close()
 
 	locRows, err := s.db.QueryContext(ctx, `SELECT country, region, city, COALESCE(lat,0), COALESCE(lng,0), COUNT(1)
-		FROM visits WHERE lat IS NOT NULL AND lng IS NOT NULL AND country != '' AND substr(created_at,1,10) >= ?
-		GROUP BY country, region, city, lat, lng ORDER BY COUNT(1) DESC LIMIT 500`, since)
+		FROM visits WHERE lat IS NOT NULL AND lng IS NOT NULL AND country != '' AND created_at >= ?
+		GROUP BY country, region, city, lat, lng ORDER BY COUNT(1) DESC LIMIT 500`, sinceStart)
 	if err != nil {
 		return nil, err
 	}
@@ -681,8 +797,8 @@ func (s *Store) GetVisitStats(ctx context.Context, recentDays int) (*storage.Vis
 	locRows.Close()
 
 	countryRows, err := s.db.QueryContext(ctx, `SELECT country, COUNT(1) FROM visits
-		WHERE country != '' AND country IS NOT NULL AND substr(created_at,1,10) >= ?
-		GROUP BY country ORDER BY COUNT(1) DESC`, since)
+		WHERE country != '' AND country IS NOT NULL AND created_at >= ?
+		GROUP BY country ORDER BY COUNT(1) DESC`, sinceStart)
 	if err != nil {
 		return nil, err
 	}
@@ -696,7 +812,7 @@ func (s *Store) GetVisitStats(ctx context.Context, recentDays int) (*storage.Vis
 	}
 	countryRows.Close()
 
-	noteRows, err := s.db.QueryContext(ctx, `SELECT id, title, like_count, comment_count, visible FROM notes ORDER BY like_count DESC, comment_count DESC`)
+	noteRows, err := s.db.QueryContext(ctx, `SELECT id, title, like_count, comment_count, visible FROM notes ORDER BY like_count DESC, comment_count DESC LIMIT 200`)
 	if err != nil {
 		return nil, err
 	}
@@ -711,6 +827,24 @@ func (s *Store) GetVisitStats(ctx context.Context, recentDays int) (*storage.Vis
 		stats.NoteStats = append(stats.NoteStats, n)
 	}
 	return stats, noteRows.Err()
+}
+
+func (s *Store) DeleteVisitsBefore(ctx context.Context, cutoffRFC3339 string, limit int) (int64, error) {
+	if strings.TrimSpace(cutoffRFC3339) == "" {
+		return 0, nil
+	}
+	if limit <= 0 {
+		limit = 5000
+	}
+	// SQLite delete with LIMIT via subquery for batched cleanup.
+	res, err := s.db.ExecContext(ctx, `DELETE FROM visits WHERE id IN (
+		SELECT id FROM visits WHERE created_at < ? ORDER BY created_at ASC LIMIT ?
+	)`, cutoffRFC3339, limit)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 type Daily struct {

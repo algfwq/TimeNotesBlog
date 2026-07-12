@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -49,9 +50,16 @@ func main() {
 	defer store.Close()
 
 	jwtSecret := strings.TrimSpace(cfg.JWTSecret)
-	if jwtSecret == "" {
-		jwtSecret = auth.EnsureSecret("")
-		log.Printf("WARNING: jwtSecret is empty; using ephemeral dev secret. Set jwtSecret for production.")
+	allowWeak := strings.TrimSpace(os.Getenv("TIMENOTES_BLOG_ALLOW_WEAK_JWT")) == "1"
+	if auth.IsWeakJWTSecret(jwtSecret) {
+		if allowWeak {
+			if jwtSecret == "" {
+				jwtSecret = auth.EnsureSecret("")
+			}
+			log.Printf("WARNING: weak jwtSecret allowed via TIMENOTES_BLOG_ALLOW_WEAK_JWT=1 (dev only)")
+		} else {
+			log.Fatalf("jwtSecret is missing or too weak (min 16 chars, not a placeholder). Set jwtSecret in config or TIMENOTES_BLOG_JWT_SECRET. For local dev only: TIMENOTES_BLOG_ALLOW_WEAK_JWT=1")
+		}
 	}
 
 	adminHash, err := auth.HashPassword("123456", cfg.PasswordPepper)
@@ -66,6 +74,10 @@ func main() {
 	adminToken := protocol.NewToken(24)
 	if _, err := rand.Read(make([]byte, 1)); err != nil {
 		adminToken = hex.EncodeToString([]byte(time.Now().Format(time.RFC3339Nano)))
+	}
+	adminTokenShort := adminToken
+	if len(adminTokenShort) > 8 {
+		adminTokenShort = adminTokenShort[:8] + "…"
 	}
 
 	geoProvider := geo.NewProvider(geo.Config{
@@ -84,19 +96,24 @@ func main() {
 		return allowOrigin(origin, cfg.CORSOrigins, cfg.AllowLoopbackOrigins)
 	}
 
+	// BodyLimit must cover hero video uploads (up to 80MB) and note uploads.
+	bodyLimit := int(cfg.MaxUploadBytes)
+	if bodyLimit < 80*1024*1024 {
+		bodyLimit = 80 * 1024 * 1024
+	}
 	app := fiber.New(fiber.Config{
 		AppName:      "TimeNotes Blog Server",
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
-		BodyLimit:    int(cfg.MaxUploadBytes),
+		BodyLimit:    bodyLimit,
 		// Keep trailing slash distinct so /admin/{token}/ is not normalized into a redirect loop.
 		StrictRouting: true,
 	})
 	app.Use(cors.New(cors.Config{
 		AllowOriginsFunc: allowOriginFn,
 		AllowMethods:     []string{fiber.MethodGet, fiber.MethodPost, fiber.MethodOptions, fiber.MethodHead},
-		AllowHeaders:     []string{"Content-Type", "Upgrade", "Connection", "Authorization"},
+		AllowHeaders:     []string{"Content-Type", "Upgrade", "Connection", "Authorization", "X-Admin-Token"},
 	}))
 
 	hub := server.NewHub(store, geoProvider, server.Options{
@@ -114,6 +131,9 @@ func main() {
 		MaxWSConnPerIPPerMinute:  cfg.MaxWSConnPerIPPerMinute,
 		MaxLoginPerIPPerMinute:   cfg.MaxLoginPerIPPerMinute,
 		MaxCommentPerIPPerMinute: cfg.MaxCommentPerIPPerMinute,
+		MaxVisitPerIPPerMinute:   cfg.MaxVisitPerIPPerMinute,
+		MaxReadPerIPPerMinute:    cfg.MaxReadPerIPPerMinute,
+		VisitRetentionDays:       cfg.VisitRetentionDays,
 		TrustedProxies:           cfg.TrustedProxies,
 		AdminPathToken:           adminToken,
 		GeoCacheTTL:              time.Duration(cfg.Geo.CacheTTLHours) * time.Hour,
@@ -130,9 +150,12 @@ func main() {
 	server.MountStatic(app, webDir, adminToken)
 
 	log.Printf("TimeNotes Blog server config=%s addr=%s db=%s notes=%s", cfg.ConfigPath, cfg.Addr, cfg.DBPath, cfg.NotesDir)
-	log.Printf("Admin UI: http://%s/admin/%s/", displayHost(cfg.Addr), adminToken)
+	// Full admin URL only on stdout for operators; avoid repeating full token in rotated log files if multi-writer includes file.
+	fmt.Fprintf(os.Stdout, "Admin UI: http://%s/admin/%s/\n", displayHost(cfg.Addr), adminToken)
+	log.Printf("Admin UI path token prefix=%s (full URL printed once on stdout)", adminTokenShort)
 	if created {
-		log.Printf("Default admin account created: username=admin password=123456 (change immediately)")
+		fmt.Fprintln(os.Stdout, "Default admin account created: username=admin password=123456 (change immediately)")
+		log.Printf("Default admin account created (change credentials immediately; password not written to log file)")
 	} else {
 		log.Printf("Admin account already exists in database (default password only applies on first start)")
 	}
@@ -180,7 +203,7 @@ func configureLogging(logPath string, maxBytes int64) (*os.File, error) {
 			return nil, err
 		}
 	}
-	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}

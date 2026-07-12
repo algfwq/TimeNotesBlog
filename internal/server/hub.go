@@ -20,6 +20,7 @@ import (
 
 	"github.com/gofiber/contrib/v3/websocket"
 	"github.com/gofiber/fiber/v3"
+	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
 
 	"timenotesblog/internal/auth"
@@ -46,6 +47,9 @@ type Options struct {
 	MaxLoginPerIPPerMinute   int
 	MaxCommentPerIPPerMinute int
 	MaxChallengePerIPPerMinute int
+	MaxVisitPerIPPerMinute   int
+	MaxReadPerIPPerMinute    int
+	VisitRetentionDays       int
 	UploadTTL                time.Duration
 	LimiterIdleTTL           time.Duration
 	TrustedProxies           []string
@@ -62,17 +66,24 @@ type Hub struct {
 	geo          geo.Provider
 	events       *eventHub
 	uploads      sync.Map // uploadID -> *uploadState
-	wsLimit      sync.Map // ip -> *rateBucket
-	loginLimit   sync.Map
-	commentLimit sync.Map
+	wsLimit        sync.Map // ip -> *rateBucket
+	loginLimit     sync.Map
+	commentLimit   sync.Map
 	challengeLimit sync.Map
-	trusted      []*net.IPNet
-	archive      ArchiveLimits
-	stopCleanup  chan struct{}
-	cleanupOnce  sync.Once
+	visitLimit     sync.Map
+	readLimit      sync.Map
+	trusted        []*net.IPNet
+	archive        ArchiveLimits
+	stopCleanup    chan struct{}
+	cleanupOnce    sync.Once
+	geoFlight      singleflight.Group
+	statsCoalesce  sync.Mutex
+	statsPending   bool
+	statsTimer     *time.Timer
 }
 
 type rateBucket struct {
+	mu       sync.Mutex
 	limiter  *rate.Limiter
 	lastSeen time.Time
 }
@@ -132,6 +143,15 @@ func NewHub(store storage.Store, geoProvider geo.Provider, opts Options) *Hub {
 	if opts.LimiterIdleTTL <= 0 {
 		opts.LimiterIdleTTL = time.Hour
 	}
+	if opts.MaxVisitPerIPPerMinute <= 0 {
+		opts.MaxVisitPerIPPerMinute = 60
+	}
+	if opts.MaxReadPerIPPerMinute <= 0 {
+		opts.MaxReadPerIPPerMinute = 120
+	}
+	if opts.VisitRetentionDays <= 0 {
+		opts.VisitRetentionDays = 90
+	}
 	if strings.TrimSpace(opts.CoversDir) == "" {
 		opts.CoversDir = filepath.Join(filepath.Dir(opts.NotesDir), "covers")
 	}
@@ -182,6 +202,21 @@ func (h *Hub) cleanupLoop() {
 			h.cleanupUploads()
 			h.cleanupLimiters()
 			_ = h.store.DeleteExpiredDownloadTokens(context.Background(), time.Now())
+			h.cleanupOldVisits()
+		}
+	}
+}
+
+func (h *Hub) cleanupOldVisits() {
+	if h.opts.VisitRetentionDays <= 0 {
+		return
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -h.opts.VisitRetentionDays).Format(time.RFC3339Nano)
+	// Batched delete to avoid long locks.
+	for i := 0; i < 20; i++ {
+		n, err := h.store.DeleteVisitsBefore(context.Background(), cutoff, 5000)
+		if err != nil || n == 0 {
+			return
 		}
 	}
 }
@@ -211,10 +246,13 @@ func (h *Hub) cleanupUploads() {
 
 func (h *Hub) cleanupLimiters() {
 	cutoff := time.Now().Add(-h.opts.LimiterIdleTTL)
-	for _, m := range []*sync.Map{&h.wsLimit, &h.loginLimit, &h.commentLimit, &h.challengeLimit} {
+	for _, m := range []*sync.Map{&h.wsLimit, &h.loginLimit, &h.commentLimit, &h.challengeLimit, &h.visitLimit, &h.readLimit} {
 		m.Range(func(key, value any) bool {
 			b := value.(*rateBucket)
-			if b.lastSeen.Before(cutoff) {
+			b.mu.Lock()
+			idle := b.lastSeen.Before(cutoff)
+			b.mu.Unlock()
+			if idle {
 				m.Delete(key)
 			}
 			return true
@@ -309,6 +347,14 @@ func (h *Hub) allowChallenge(ip string) bool {
 	return allowRate(&h.challengeLimit, ip, h.opts.MaxChallengePerIPPerMinute)
 }
 
+func (h *Hub) allowVisit(ip string) bool {
+	return allowRate(&h.visitLimit, ip, h.opts.MaxVisitPerIPPerMinute)
+}
+
+func (h *Hub) allowRead(ip string) bool {
+	return allowRate(&h.readLimit, ip, h.opts.MaxReadPerIPPerMinute)
+}
+
 func allowRate(m *sync.Map, ip string, perMin int) bool {
 	if perMin <= 0 {
 		return true
@@ -319,8 +365,11 @@ func allowRate(m *sync.Map, ip string, perMin int) bool {
 		lastSeen: now,
 	})
 	b := v.(*rateBucket)
+	b.mu.Lock()
 	b.lastSeen = now
-	return b.limiter.Allow()
+	ok := b.limiter.Allow()
+	b.mu.Unlock()
+	return ok
 }
 
 func (h *Hub) serveWS(conn *websocket.Conn) {
@@ -375,7 +424,10 @@ func (cs *clientSession) reply(env protocol.Envelope) {
 	select {
 	case cs.send <- env:
 	case <-cs.closed:
-	case <-time.After(2 * time.Second):
+	default:
+		// Slow client: do not block the whole room; disconnect.
+		log.Printf("slow_client_disconnect ip_hash=%s", shortHash(cs.ipHash))
+		go cs.close()
 	}
 }
 
@@ -505,9 +557,14 @@ func (cs *clientSession) requireCurrentUser(ctx context.Context) (*storage.User,
 		cs.user = nil
 		return nil, errors.New("unauthorized")
 	}
+	if cs.user.CredentialsVersion != u.CredentialsVersion {
+		cs.user = nil
+		return nil, errors.New("unauthorized")
+	}
 	// Keep session claims aligned with live role/username.
 	cs.user.Username = u.Username
 	cs.user.Role = u.Role
+	cs.user.CredentialsVersion = u.CredentialsVersion
 	return u, nil
 }
 
@@ -530,7 +587,17 @@ func (cs *clientSession) requireCurrentAdmin(ctx context.Context) (*storage.User
 	if u.Role != "admin" {
 		return nil, errors.New("forbidden")
 	}
+	if u.MustChangeCredentials {
+		return nil, errors.New("credentials_required")
+	}
 	return u, nil
+}
+
+func (cs *clientSession) attachSession(user *storage.User, claims *auth.Claims) {
+	claims.Username = user.Username
+	claims.Role = user.Role
+	claims.CredentialsVersion = user.CredentialsVersion
+	cs.user = claims
 }
 
 func (cs *clientSession) handlePowChallenge(ctx context.Context, env protocol.Envelope) {
@@ -566,91 +633,20 @@ func (cs *clientSession) handleLogin(ctx context.Context, env protocol.Envelope)
 		return
 	}
 // Token re-auth path (no PoW when JWT still valid).
-		if strings.TrimSpace(req.Token) != "" {
-			claims, err := auth.ParseJWT(cs.hub.opts.JWTSecret, req.Token)
-			if err != nil {
-				cs.replyErr(env.ID, "invalid_token", "token invalid or expired")
-				return
-			}
-			user, err := cs.hub.store.GetUserByID(ctx, claims.UserID)
-			if err != nil {
-				cs.replyErr(env.ID, "invalid_token", "token invalid or expired")
-				return
-			}
-			claims.Username = user.Username
-			claims.Role = user.Role
-			cs.user = claims
-			cs.replyOK(protocol.TypeAuthLogin, env.ID, map[string]any{
-				"token":                 req.Token,
-				"userId":                user.ID,
-				"username":              user.Username,
-				"role":                  user.Role,
-				"canUpload":             user.CanUpload,
-				"mustChangeCredentials": user.MustChangeCredentials,
-				"expiresAt":             claims.Exp,
-			})
-			return
-		}
-
-		ok, err := cs.hub.pow.VerifyBound(req.ChallengeID, cs.ipHash, cs.wsSession, req.Nonce)
-		if err != nil || !ok {
-			_, _ = cs.hub.store.BumpLoginFailure(ctx, cs.ipHash, time.Now())
-			cs.replyErr(env.ID, "pow_failed", "proof of work failed")
-			return
-		}
-		user, err := cs.hub.store.GetUserByUsername(ctx, strings.TrimSpace(req.Username))
-		if err != nil {
-			_, _ = cs.hub.store.BumpLoginFailure(ctx, cs.ipHash, time.Now())
-			cs.replyErr(env.ID, "auth_failed", "invalid username or password")
-			return
-		}
-		match, err := auth.VerifyPassword(user.PasswordHash, req.Password, cs.hub.opts.PasswordPepper)
-		if err != nil || !match {
-			_, _ = cs.hub.store.BumpLoginFailure(ctx, cs.ipHash, time.Now())
-			cs.replyErr(env.ID, "auth_failed", "invalid username or password")
-			return
-		}
-		_ = cs.hub.store.ResetLoginFailures(ctx, cs.ipHash)
-		claims := auth.NewClaims(user.ID, user.Username, user.Role, cs.hub.opts.JWTExpiry)
-		token, err := auth.IssueJWT(cs.hub.opts.JWTSecret, claims)
-		if err != nil {
-			cs.replyErr(env.ID, "token_error", "failed to issue token")
-			return
-		}
-		cs.user = &claims
-		cs.replyOK(protocol.TypeAuthLogin, env.ID, map[string]any{
-			"token":                 token,
-			"userId":                user.ID,
-			"username":              user.Username,
-			"role":                  user.Role,
-			"canUpload":             user.CanUpload,
-			"mustChangeCredentials": user.MustChangeCredentials,
-			"expiresAt":             claims.Exp,
-		})
-	}
-
-	func (cs *clientSession) handleSession(env protocol.Envelope) {
-		req, err := protocol.DecodePayload[struct {
-			Token string `json:"token"`
-		}](env)
-		if err != nil || req.Token == "" {
-			cs.replyErr(env.ID, "bad_payload", "token required")
-			return
-		}
+	if strings.TrimSpace(req.Token) != "" {
 		claims, err := auth.ParseJWT(cs.hub.opts.JWTSecret, req.Token)
 		if err != nil {
 			cs.replyErr(env.ID, "invalid_token", "token invalid or expired")
 			return
 		}
-		user, err := cs.hub.store.GetUserByID(context.Background(), claims.UserID)
-		if err != nil {
+		user, err := cs.hub.store.GetUserByID(ctx, claims.UserID)
+		if err != nil || claims.CredentialsVersion != user.CredentialsVersion {
 			cs.replyErr(env.ID, "invalid_token", "token invalid or expired")
 			return
 		}
-		claims.Username = user.Username
-		claims.Role = user.Role
-		cs.user = claims
-		cs.replyOK(protocol.TypeAuthSession, env.ID, map[string]any{
+		cs.attachSession(user, claims)
+		cs.replyOK(protocol.TypeAuthLogin, env.ID, map[string]any{
+			"token":                 req.Token,
 			"userId":                user.ID,
 			"username":              user.Username,
 			"role":                  user.Role,
@@ -658,7 +654,74 @@ func (cs *clientSession) handleLogin(ctx context.Context, env protocol.Envelope)
 			"mustChangeCredentials": user.MustChangeCredentials,
 			"expiresAt":             claims.Exp,
 		})
+		return
 	}
+
+	ok, err := cs.hub.pow.VerifyBound(req.ChallengeID, cs.ipHash, cs.wsSession, req.Nonce)
+	if err != nil || !ok {
+		_, _ = cs.hub.store.BumpLoginFailure(ctx, cs.ipHash, time.Now())
+		cs.replyErr(env.ID, "pow_failed", "proof of work failed")
+		return
+	}
+	user, err := cs.hub.store.GetUserByUsername(ctx, strings.TrimSpace(req.Username))
+	if err != nil {
+		_, _ = cs.hub.store.BumpLoginFailure(ctx, cs.ipHash, time.Now())
+		cs.replyErr(env.ID, "auth_failed", "invalid username or password")
+		return
+	}
+	match, err := auth.VerifyPassword(user.PasswordHash, req.Password, cs.hub.opts.PasswordPepper)
+	if err != nil || !match {
+		_, _ = cs.hub.store.BumpLoginFailure(ctx, cs.ipHash, time.Now())
+		cs.replyErr(env.ID, "auth_failed", "invalid username or password")
+		return
+	}
+	_ = cs.hub.store.ResetLoginFailures(ctx, cs.ipHash)
+	claims := auth.NewClaims(user.ID, user.Username, user.Role, user.CredentialsVersion, cs.hub.opts.JWTExpiry)
+	token, err := auth.IssueJWT(cs.hub.opts.JWTSecret, claims)
+	if err != nil {
+		cs.replyErr(env.ID, "token_error", "failed to issue token")
+		return
+	}
+	cs.attachSession(user, &claims)
+	cs.replyOK(protocol.TypeAuthLogin, env.ID, map[string]any{
+		"token":                 token,
+		"userId":                user.ID,
+		"username":              user.Username,
+		"role":                  user.Role,
+		"canUpload":             user.CanUpload,
+		"mustChangeCredentials": user.MustChangeCredentials,
+		"expiresAt":             claims.Exp,
+	})
+}
+
+func (cs *clientSession) handleSession(env protocol.Envelope) {
+	req, err := protocol.DecodePayload[struct {
+		Token string `json:"token"`
+	}](env)
+	if err != nil || req.Token == "" {
+		cs.replyErr(env.ID, "bad_payload", "token required")
+		return
+	}
+	claims, err := auth.ParseJWT(cs.hub.opts.JWTSecret, req.Token)
+	if err != nil {
+		cs.replyErr(env.ID, "invalid_token", "token invalid or expired")
+		return
+	}
+	user, err := cs.hub.store.GetUserByID(context.Background(), claims.UserID)
+	if err != nil || claims.CredentialsVersion != user.CredentialsVersion {
+		cs.replyErr(env.ID, "invalid_token", "token invalid or expired")
+		return
+	}
+	cs.attachSession(user, claims)
+	cs.replyOK(protocol.TypeAuthSession, env.ID, map[string]any{
+		"userId":                user.ID,
+		"username":              user.Username,
+		"role":                  user.Role,
+		"canUpload":             user.CanUpload,
+		"mustChangeCredentials": user.MustChangeCredentials,
+		"expiresAt":             claims.Exp,
+	})
+}
 
 func (cs *clientSession) handlePing(env protocol.Envelope) {
 	if _, err := cs.requireUser(); err != nil {
@@ -669,7 +732,16 @@ func (cs *clientSession) handlePing(env protocol.Envelope) {
 }
 
 func (cs *clientSession) handleNotesList(ctx context.Context, env protocol.Envelope) {
-	notes, err := cs.hub.store.ListVisibleNotes(ctx)
+	req, _ := protocol.DecodePayload[struct {
+		Limit  int `json:"limit"`
+		Offset int `json:"offset"`
+	}](env)
+	limit, offset := req.Limit, req.Offset
+	if limit <= 0 {
+		// Backward compatible: no limit means return a large page (legacy clients).
+		limit = 100
+	}
+	notes, total, err := cs.hub.store.ListNotesPage(ctx, true, limit, offset)
 	if err != nil {
 		cs.replyErr(env.ID, "db_error", "failed to list notes")
 		return
@@ -679,7 +751,12 @@ func (cs *clientSession) handleNotesList(ctx context.Context, env protocol.Envel
 		n := publicNoteView(&notes[i])
 		out = append(out, n)
 	}
-	cs.replyOK(protocol.TypeNotesList, env.ID, map[string]any{"notes": out})
+	cs.replyOK(protocol.TypeNotesList, env.ID, map[string]any{
+		"notes":  out,
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
+	})
 }
 
 func (cs *clientSession) issueDownloadURL(ctx context.Context, noteID, purpose string) (string, error) {
@@ -714,6 +791,10 @@ func noteCoverURL(note *storage.Note) string {
 }
 
 func (cs *clientSession) handleNotesGet(ctx context.Context, env protocol.Envelope) {
+	if !cs.hub.allowRead(cs.ip) {
+		cs.replyErr(env.ID, "rate_limited", "too many requests")
+		return
+	}
 	req, err := protocol.DecodePayload[struct {
 		ID string `json:"id"`
 	}](env)
@@ -1184,18 +1265,41 @@ note, _ = cs.hub.store.GetNote(ctx, req.ID)
 
 func (cs *clientSession) handleCommentsList(ctx context.Context, env protocol.Envelope) {
 	req, err := protocol.DecodePayload[struct {
-		ID string `json:"id"`
+		ID              string `json:"id"`
+		Limit           int    `json:"limit"`
+		BeforeCreatedAt string `json:"beforeCreatedAt"`
+		BeforeID        string `json:"beforeId"`
 	}](env)
 	if err != nil || req.ID == "" {
 		cs.replyErr(env.ID, "bad_payload", "id required")
 		return
 	}
-	comments, err := cs.hub.store.ListComments(ctx, req.ID)
+	note, err := cs.hub.store.GetNote(ctx, req.ID)
+	if err != nil {
+		cs.replyErr(env.ID, "not_found", "note not found")
+		return
+	}
+	if !note.Visible {
+		if _, aerr := cs.requireCurrentAdmin(ctx); aerr != nil {
+			cs.replyErr(env.ID, "not_found", "note not found")
+			return
+		}
+	}
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 30
+	}
+	comments, hasMore, err := cs.hub.store.ListCommentsPage(ctx, req.ID, limit, req.BeforeCreatedAt, req.BeforeID)
 	if err != nil {
 		cs.replyErr(env.ID, "db_error", "list failed")
 		return
 	}
-	cs.replyOK(protocol.TypeNotesCommentsList, env.ID, map[string]any{"comments": comments})
+	// Email remains public by product decision.
+	cs.replyOK(protocol.TypeNotesCommentsList, env.ID, map[string]any{
+		"comments": comments,
+		"hasMore":  hasMore,
+		"limit":    limit,
+	})
 }
 
 type commentCreateReq struct {
@@ -1299,6 +1403,10 @@ func githubUsername(raw string) string {
 }
 
 func (cs *clientSession) handleVisit(ctx context.Context, env protocol.Envelope) {
+	if !cs.hub.allowVisit(cs.ip) {
+		cs.replyErr(env.ID, "rate_limited", "too many visits")
+		return
+	}
 	req, err := protocol.DecodePayload[struct {
 		Path      string `json:"path"`
 		NoteID    string `json:"noteId"`
@@ -1327,31 +1435,53 @@ if info, err := cs.hub.store.GetGeoCache(ctx, cs.ipHash, cs.hub.opts.GeoCacheTTL
 			cs.replyErr(env.ID, "db_error", "visit failed")
 			return
 		}
-		cs.hub.events.broadcast(protocol.TypeEventStatsChanged, map[string]any{"reason": "visit"}, audienceAdmin)
+		cs.hub.broadcastStatsChanged("visit")
 		cs.replyOK(protocol.TypeVisitTrack, env.ID, map[string]any{"ok": true})
 	}
 
-	func (h *Hub) resolveGeoAsync(ip, ipHash string) {
-		// Public GeoIP APIs reject loopback/private ranges; skip to avoid noisy logs.
-		if parsed := net.ParseIP(strings.TrimSpace(ip)); parsed != nil {
-			if parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast() || parsed.IsUnspecified() {
-				return
-			}
+func (h *Hub) resolveGeoAsync(ip, ipHash string) {
+	// Public GeoIP APIs reject loopback/private ranges; skip to avoid noisy logs.
+	if parsed := net.ParseIP(strings.TrimSpace(ip)); parsed != nil {
+		if parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast() || parsed.IsUnspecified() {
+			return
 		}
+	}
+	_, _, _ = h.geoFlight.Do(ipHash, func() (any, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if _, err := h.store.GetGeoCache(ctx, ipHash, h.opts.GeoCacheTTL); err == nil {
-			return
+			return nil, nil
 		}
 		info, err := h.geo.Lookup(ctx, ip)
 		if err != nil {
 			log.Printf("geo lookup failed ip_hash=%s err=%v", shortHash(ipHash), err)
-			return
+			return nil, err
 		}
 		_ = h.store.PutGeoCache(ctx, ipHash, info)
 		_ = h.store.BackfillVisitGeo(ctx, ipHash, info)
-		h.events.broadcast(protocol.TypeEventStatsChanged, map[string]any{"reason": "geo"}, audienceAdmin)
+		h.broadcastStatsChanged("geo")
+		return nil, nil
+	})
+}
+
+func (h *Hub) broadcastStatsChanged(reason string) {
+	h.statsCoalesce.Lock()
+	defer h.statsCoalesce.Unlock()
+	h.statsPending = true
+	if h.statsTimer != nil {
+		return
 	}
+	h.statsTimer = time.AfterFunc(time.Second, func() {
+		h.statsCoalesce.Lock()
+		pending := h.statsPending
+		h.statsPending = false
+		h.statsTimer = nil
+		h.statsCoalesce.Unlock()
+		if pending {
+			h.events.broadcast(protocol.TypeEventStatsChanged, map[string]any{"reason": reason}, audienceAdmin)
+		}
+	})
+}
 
 func shortHash(h string) string {
 	if len(h) >= 8 {
@@ -1361,20 +1491,37 @@ func shortHash(h string) string {
 }
 
 func (cs *clientSession) handleAdminNotesList(ctx context.Context, env protocol.Envelope) {
-		if _, err := cs.requireCurrentAdmin(ctx); err != nil {
-			cs.replyErr(env.ID, "forbidden", "admin required")
+	if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+		if errors.Is(err, errors.New("credentials_required")) || strings.Contains(err.Error(), "credentials_required") {
+			cs.replyErr(env.ID, "credentials_required", "change default credentials first")
 			return
 		}
-		notes, err := cs.hub.store.ListAllNotes(ctx)
-		if err != nil {
-			cs.replyErr(env.ID, "db_error", "list failed")
-			return
-		}
-		for i := range notes {
-			notes[i].CoverURL = noteCoverURL(&notes[i])
-		}
-		cs.replyOK(protocol.TypeAdminNotesList, env.ID, map[string]any{"notes": notes})
+		cs.replyErr(env.ID, "forbidden", "admin required")
+		return
 	}
+	req, _ := protocol.DecodePayload[struct {
+		Limit  int `json:"limit"`
+		Offset int `json:"offset"`
+	}](env)
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	notes, total, err := cs.hub.store.ListNotesPage(ctx, false, limit, req.Offset)
+	if err != nil {
+		cs.replyErr(env.ID, "db_error", "list failed")
+		return
+	}
+	for i := range notes {
+		notes[i].CoverURL = noteCoverURL(&notes[i])
+	}
+	cs.replyOK(protocol.TypeAdminNotesList, env.ID, map[string]any{
+		"notes":  notes,
+		"total":  total,
+		"limit":  limit,
+		"offset": req.Offset,
+	})
+}
 
 	func (cs *clientSession) handleAdminSetVisible(ctx context.Context, env protocol.Envelope) {
 		if _, err := cs.requireCurrentAdmin(ctx); err != nil {
@@ -1487,18 +1634,35 @@ func (cs *clientSession) handleAdminNotesList(ctx context.Context, env protocol.
 		cs.replyOK(protocol.TypeAdminNoteDelete, env.ID, map[string]any{"ok": true})
 	}
 
-	func (cs *clientSession) handleAdminUsersList(ctx context.Context, env protocol.Envelope) {
-		if _, err := cs.requireCurrentAdmin(ctx); err != nil {
-			cs.replyErr(env.ID, "forbidden", "admin required")
+func (cs *clientSession) handleAdminUsersList(ctx context.Context, env protocol.Envelope) {
+	if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+		if strings.Contains(err.Error(), "credentials_required") {
+			cs.replyErr(env.ID, "credentials_required", "change default credentials first")
 			return
 		}
-		users, err := cs.hub.store.ListUsers(ctx)
-		if err != nil {
-			cs.replyErr(env.ID, "db_error", "list failed")
-			return
-		}
-		cs.replyOK(protocol.TypeAdminUsersList, env.ID, map[string]any{"users": users})
+		cs.replyErr(env.ID, "forbidden", "admin required")
+		return
 	}
+	req, _ := protocol.DecodePayload[struct {
+		Limit  int `json:"limit"`
+		Offset int `json:"offset"`
+	}](env)
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	users, total, err := cs.hub.store.ListUsersPage(ctx, limit, req.Offset)
+	if err != nil {
+		cs.replyErr(env.ID, "db_error", "list failed")
+		return
+	}
+	cs.replyOK(protocol.TypeAdminUsersList, env.ID, map[string]any{
+		"users":  users,
+		"total":  total,
+		"limit":  limit,
+		"offset": req.Offset,
+	})
+}
 
 	func (cs *clientSession) handleAdminUserCreate(ctx context.Context, env protocol.Envelope) {
 		if _, err := cs.requireCurrentAdmin(ctx); err != nil {
@@ -1634,12 +1798,17 @@ u.PasswordHash = ""
 			u.Username = name
 		}
 		if req.Password != nil && *req.Password != "" {
+			if len(strings.TrimSpace(*req.Password)) < 8 {
+				cs.replyErr(env.ID, "bad_payload", "password too short")
+				return
+			}
 			hash, err := auth.HashPassword(*req.Password, cs.hub.opts.PasswordPepper)
 			if err != nil {
 				cs.replyErr(env.ID, "hash_error", "hash failed")
 				return
 			}
 			u.PasswordHash = hash
+			u.CredentialsVersion++
 		}
 		if req.Role != nil {
 			nextRole := "user"
@@ -1676,8 +1845,9 @@ u.PasswordHash = ""
 	}
 
 	func (cs *clientSession) handleAdminSelfUpdate(ctx context.Context, env protocol.Envelope) {
-		admin, err := cs.requireCurrentAdmin(ctx)
-		if err != nil {
+		// Allow forced credential migration: do NOT use requireCurrentAdmin (blocks mustChange).
+		admin, err := cs.requireCurrentUser(ctx)
+		if err != nil || admin.Role != "admin" {
 			cs.replyErr(env.ID, "forbidden", "admin required")
 			return
 		}
@@ -1722,12 +1892,17 @@ u.PasswordHash = ""
 				cs.replyErr(env.ID, "bad_payload", "choose a non-default password")
 				return
 			}
+			if len(strings.TrimSpace(*req.Password)) < 8 {
+				cs.replyErr(env.ID, "bad_payload", "password too short")
+				return
+			}
 			hash, err := auth.HashPassword(*req.Password, cs.hub.opts.PasswordPepper)
 			if err != nil {
 				cs.replyErr(env.ID, "hash_error", "hash failed")
 				return
 			}
 			u.PasswordHash = hash
+			u.CredentialsVersion++
 		}
 		if u.MustChangeCredentials && usernameProvided && passwordProvided {
 			u.MustChangeCredentials = false
@@ -1739,6 +1914,7 @@ u.PasswordHash = ""
 		}
 		if cs.user != nil {
 			cs.user.Username = u.Username
+			cs.user.CredentialsVersion = u.CredentialsVersion
 		}
 		cs.hub.events.broadcast(protocol.TypeEventUserChanged, map[string]any{"user": map[string]any{
 			"id": u.ID, "username": u.Username, "role": u.Role, "canUpload": u.CanUpload, "mustChangeCredentials": u.MustChangeCredentials,
@@ -2055,19 +2231,31 @@ func validateHeroMedia(data []byte) (ext, mime, kind string, err error) {
 }
 
 func (h *Hub) commitSiteBackground(ctx context.Context, data []byte, ext string) (map[string]any, error) {
+	tmp := filepath.Join(h.opts.SiteDir, "hero-commit.part")
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return nil, errors.New("write failed")
+	}
+	return h.commitSiteBackgroundFile(ctx, tmp, ext)
+}
+
+func (h *Hub) commitSiteBackgroundFile(ctx context.Context, tmpPath, ext string) (map[string]any, error) {
 	cur, err := h.store.GetSiteSettings(ctx)
 	if err != nil {
+		_ = os.Remove(tmpPath)
 		return nil, err
 	}
 	oldPath := cur.BackgroundPath
 	dest := filepath.Join(h.opts.SiteDir, "hero"+ext)
-	tmp := dest + ".part"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return nil, errors.New("write failed")
-	}
-	if err := os.Rename(tmp, dest); err != nil {
-		_ = os.Remove(tmp)
-		return nil, errors.New("commit failed")
+	if err := os.Rename(tmpPath, dest); err != nil {
+		// Cross-device rename fallback.
+		data, rerr := os.ReadFile(tmpPath)
+		_ = os.Remove(tmpPath)
+		if rerr != nil {
+			return nil, errors.New("commit failed")
+		}
+		if err := os.WriteFile(dest, data, 0o644); err != nil {
+			return nil, errors.New("commit failed")
+		}
 	}
 	if oldPath != "" && oldPath != dest {
 		_ = os.Remove(oldPath)
@@ -2114,20 +2302,60 @@ func (h *Hub) handleSiteBackgroundHTTPUpload(c fiber.Ctx) error {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "open failed"})
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxVideo+1))
-	if err != nil {
+	// Sniff first 512 bytes for magic, then stream rest to disk (avoid 80MB heap spike).
+	head := make([]byte, 512)
+	n, err := io.ReadFull(f, head)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "read failed"})
 	}
-	if int64(len(data)) > maxVideo {
-		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "file too large"})
-	}
-	ext, mime, kind, err := validateHeroMedia(data)
+	head = head[:n]
+	ext, mime, kind, err := validateHeroMedia(head)
 	if err != nil {
+		// For short images, head may be complete; for large video, magic is in first bytes.
+		// If image validation fails only because truncated, try full read for small images.
+		if file.Size <= 5*1024*1024 {
+			rest, rerr := io.ReadAll(io.LimitReader(f, maxVideo))
+			if rerr != nil {
+				return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "read failed"})
+			}
+			full := append(head, rest...)
+			ext, mime, kind, err = validateHeroMedia(full)
+			if err != nil {
+				return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+			}
+			_ = mime
+			_ = kind
+			pub, cerr := h.commitSiteBackground(c.Context(), full, ext)
+			if cerr != nil {
+				return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": cerr.Error()})
+			}
+			return c.JSON(fiber.Map{"settings": pub})
+		}
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 	_ = mime
 	_ = kind
-	pub, err := h.commitSiteBackground(c.Context(), data, ext)
+	tmp := filepath.Join(h.opts.SiteDir, "hero-upload.part")
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "write failed"})
+	}
+	if _, err := out.Write(head); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmp)
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "write failed"})
+	}
+	written, err := io.Copy(out, io.LimitReader(f, maxVideo-int64(len(head))+1))
+	_ = out.Close()
+	if err != nil {
+		_ = os.Remove(tmp)
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "read failed"})
+	}
+	if int64(len(head))+written > maxVideo {
+		_ = os.Remove(tmp)
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "file too large"})
+	}
+	pub, err := h.commitSiteBackgroundFile(c.Context(), tmp, ext)
 	if err != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -2185,38 +2413,60 @@ func (h *Hub) handleSiteBackgroundHTTPUpload(c fiber.Ctx) error {
 		c.Set("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, disposition, strings.ReplaceAll(filename, `"`, "")))
 		c.Set("X-Content-Type-Options", "nosniff")
 		c.Set("Cache-Control", "no-store")
+		if !pathUnderDir(note.StoragePath, h.opts.NotesDir) {
+			return fiber.ErrNotFound
+		}
 		return c.SendFile(note.StoragePath)
 	}
 
-	func (h *Hub) handleCover(c fiber.Ctx) error {
-		id := strings.TrimSpace(c.Params("id"))
-		if id == "" || strings.Contains(id, "/") || strings.Contains(id, "\\") || strings.Contains(id, "..") {
-			return fiber.ErrNotFound
-		}
-		note, err := h.store.GetNote(c.Context(), id)
-		if err != nil {
-			return fiber.ErrNotFound
-		}
-		if !note.Visible {
-			// Covers for hidden notes are admin-only; public cover endpoint hides existence.
-			return fiber.ErrNotFound
-		}
-		if strings.TrimSpace(note.CoverPath) == "" {
-			return fiber.ErrNotFound
-		}
-		switch strings.ToLower(filepath.Ext(note.CoverPath)) {
-		case ".jpg", ".jpeg":
-			c.Set("Content-Type", "image/jpeg")
-		case ".webp":
-			c.Set("Content-Type", "image/webp")
-		case ".gif":
-			c.Set("Content-Type", "image/gif")
-		default:
-			c.Set("Content-Type", "image/png")
-		}
-		c.Set("Cache-Control", "public, max-age=3600")
-		return c.SendFile(note.CoverPath)
+func pathUnderDir(path, dir string) bool {
+	if strings.TrimSpace(path) == "" || strings.TrimSpace(dir) == "" {
+		return false
 	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	prefix := absDir + string(os.PathSeparator)
+	return absPath == absDir || strings.HasPrefix(absPath, prefix)
+}
+
+func (h *Hub) handleCover(c fiber.Ctx) error {
+	id := strings.TrimSpace(c.Params("id"))
+	if id == "" || strings.Contains(id, "/") || strings.Contains(id, "\\") || strings.Contains(id, "..") {
+		return fiber.ErrNotFound
+	}
+	note, err := h.store.GetNote(c.Context(), id)
+	if err != nil {
+		return fiber.ErrNotFound
+	}
+	if !note.Visible {
+		// Covers for hidden notes are admin-only; public cover endpoint hides existence.
+		return fiber.ErrNotFound
+	}
+	if strings.TrimSpace(note.CoverPath) == "" {
+		return fiber.ErrNotFound
+	}
+	if !pathUnderDir(note.CoverPath, h.opts.CoversDir) {
+		return fiber.ErrNotFound
+	}
+	switch strings.ToLower(filepath.Ext(note.CoverPath)) {
+	case ".jpg", ".jpeg":
+		c.Set("Content-Type", "image/jpeg")
+	case ".webp":
+		c.Set("Content-Type", "image/webp")
+	case ".gif":
+		c.Set("Content-Type", "image/gif")
+	default:
+		c.Set("Content-Type", "image/png")
+	}
+	c.Set("Cache-Control", "public, max-age=3600")
+	return c.SendFile(note.CoverPath)
+}
 
 func (h *Hub) handleSiteBackground(c fiber.Ctx) error {
 	st, err := h.store.GetSiteSettings(c.Context())

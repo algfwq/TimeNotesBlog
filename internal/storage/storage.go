@@ -22,6 +22,7 @@ type User struct {
 	Role                  string `json:"role"`
 	CanUpload             bool   `json:"canUpload"`
 	MustChangeCredentials bool   `json:"mustChangeCredentials"`
+	CredentialsVersion    int    `json:"-"`
 	CreatedAt             string `json:"createdAt"`
 	UpdatedAt             string `json:"updatedAt"`
 }
@@ -33,7 +34,7 @@ type Note struct {
 	Filename       string `json:"filename"`
 	Title          string `json:"title"`
 	StoragePath    string `json:"-"`
-	CoverPath      string `json:"coverPath,omitempty"`
+	CoverPath      string `json:"-"`
 	SizeBytes      int64  `json:"sizeBytes"`
 	SHA256         string `json:"sha256"`
 	Visible        bool   `json:"visible"`
@@ -142,6 +143,7 @@ type Store interface {
 	GetUserByUsername(ctx context.Context, username string) (*User, error)
 	GetUserByID(ctx context.Context, id string) (*User, error)
 	ListUsers(ctx context.Context) ([]User, error)
+	ListUsersPage(ctx context.Context, limit, offset int) (users []User, total int64, err error)
 	UpdateUser(ctx context.Context, user User) error
 	DeleteUser(ctx context.Context, id string) error
 	DeleteUserAndTransferNotes(ctx context.Context, userID, targetAdminID string) error
@@ -153,6 +155,7 @@ type Store interface {
 	GetNoteByOwnerFilename(ctx context.Context, ownerID, filename string) (*Note, error)
 	ListVisibleNotes(ctx context.Context) ([]Note, error)
 	ListAllNotes(ctx context.Context) ([]Note, error)
+	ListNotesPage(ctx context.Context, visibleOnly bool, limit, offset int) (notes []Note, total int64, err error)
 	SetNoteVisible(ctx context.Context, id string, visible bool) error
 	SetNotePublicDownload(ctx context.Context, id string, enabled bool) error
 	DeleteNote(ctx context.Context, id string) error
@@ -162,6 +165,7 @@ type Store interface {
 
 	AddComment(ctx context.Context, c Comment) error
 	ListComments(ctx context.Context, noteID string) ([]Comment, error)
+	ListCommentsPage(ctx context.Context, noteID string, limit int, beforeCreatedAt, beforeID string) (comments []Comment, hasMore bool, err error)
 
 	GetLoginFailures(ctx context.Context, ipHash string) (count int, windowAt time.Time, err error)
 	BumpLoginFailure(ctx context.Context, ipHash string, now time.Time) (count int, err error)
@@ -178,6 +182,7 @@ type Store interface {
 	AddVisit(ctx context.Context, v Visit) error
 	BackfillVisitGeo(ctx context.Context, ipHash string, info GeoInfo) error
 	GetVisitStats(ctx context.Context, recentDays int) (*VisitStats, error)
+	DeleteVisitsBefore(ctx context.Context, cutoffRFC3339 string, limit int) (deleted int64, err error)
 
 	GetSiteSettings(ctx context.Context) (*SiteSettings, error)
 	UpdateSiteSettings(ctx context.Context, s SiteSettings) error

@@ -69,6 +69,9 @@ func (s *stubStore) GetUserByID(ctx context.Context, id string) (*storage.User, 
 	return &cp, nil
 }
 func (s *stubStore) ListUsers(ctx context.Context) ([]storage.User, error) { return nil, nil }
+func (s *stubStore) ListUsersPage(ctx context.Context, limit, offset int) ([]storage.User, int64, error) {
+	return nil, 0, nil
+}
 func (s *stubStore) UpdateUser(ctx context.Context, user storage.User) error {
 	cp := user
 	s.users[user.ID] = &cp
@@ -107,6 +110,9 @@ func (s *stubStore) GetNoteByOwnerFilename(ctx context.Context, ownerID, filenam
 }
 func (s *stubStore) ListVisibleNotes(ctx context.Context) ([]storage.Note, error) { return nil, nil }
 func (s *stubStore) ListAllNotes(ctx context.Context) ([]storage.Note, error)     { return nil, nil }
+func (s *stubStore) ListNotesPage(ctx context.Context, visibleOnly bool, limit, offset int) ([]storage.Note, int64, error) {
+	return nil, 0, nil
+}
 func (s *stubStore) SetNoteVisible(ctx context.Context, id string, visible bool) error {
 	return nil
 }
@@ -129,6 +135,9 @@ func (s *stubStore) HasLiked(ctx context.Context, noteID, ipHash string) (bool, 
 func (s *stubStore) AddComment(ctx context.Context, c storage.Comment) error { return nil }
 func (s *stubStore) ListComments(ctx context.Context, noteID string) ([]storage.Comment, error) {
 	return nil, nil
+}
+func (s *stubStore) ListCommentsPage(ctx context.Context, noteID string, limit int, beforeCreatedAt, beforeID string) ([]storage.Comment, bool, error) {
+	return nil, false, nil
 }
 func (s *stubStore) GetLoginFailures(ctx context.Context, ipHash string) (int, time.Time, error) {
 	return 0, time.Time{}, nil
@@ -174,6 +183,9 @@ func (s *stubStore) BackfillVisitGeo(ctx context.Context, ipHash string, info st
 }
 func (s *stubStore) GetVisitStats(ctx context.Context, recentDays int) (*storage.VisitStats, error) {
 	return &storage.VisitStats{}, nil
+}
+func (s *stubStore) DeleteVisitsBefore(ctx context.Context, cutoffRFC3339 string, limit int) (int64, error) {
+	return 0, nil
 }
 func (s *stubStore) GetSiteSettings(ctx context.Context) (*storage.SiteSettings, error) {
 	return &storage.SiteSettings{

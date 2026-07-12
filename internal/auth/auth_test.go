@@ -19,7 +19,7 @@ func TestPasswordAndJWT(t *testing.T) {
 		t.Fatal("expected mismatch")
 	}
 
-	claims := NewClaims("u1", "admin", "admin", time.Hour)
+	claims := NewClaims("u1", "admin", "admin", 0, time.Hour)
 	token, err := IssueJWT("secret-key-123456", claims)
 	if err != nil {
 		t.Fatal(err)

@@ -4,7 +4,7 @@
   "notesDir": "data/notes",
   "logPath": "logs/timenotes-blog.log",
   "logMaxBytes": 5242880,
-  "jwtSecret": "change-me-to-a-long-random-secret",
+  "jwtSecret": "replace-with-a-long-random-secret-min-16",
   "passwordPepper": "",
   "ipHashPepper": "timenotes-blog-ip",
   "maxUploadBytes": 104857600,

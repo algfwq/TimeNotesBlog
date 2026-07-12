@@ -46,6 +46,9 @@ type AppConfig struct {
 	MaxWSConnPerIPPerMinute int          `json:"maxWSConnPerIPPerMinute"`
 	MaxLoginPerIPPerMinute int           `json:"maxLoginPerIPPerMinute"`
 	MaxCommentPerIPPerMinute int         `json:"maxCommentPerIPPerMinute"`
+	MaxVisitPerIPPerMinute   int         `json:"maxVisitPerIPPerMinute"`
+	MaxReadPerIPPerMinute    int         `json:"maxReadPerIPPerMinute"`
+	VisitRetentionDays       int         `json:"visitRetentionDays"`
 	ReadDeadline           time.Duration `json:"readDeadline"`
 	Geo                    GeoConfig     `json:"geo"`
 	ConfigPath             string        `json:"-"`
@@ -92,6 +95,9 @@ func defaultConfig() AppConfig {
 		MaxWSConnPerIPPerMinute:  60,
 		MaxLoginPerIPPerMinute:   20,
 		MaxCommentPerIPPerMinute: 30,
+		MaxVisitPerIPPerMinute:   60,
+		MaxReadPerIPPerMinute:    120,
+		VisitRetentionDays:       90,
 		ReadDeadline:             60 * time.Second,
 		Geo: GeoConfig{
 			Provider:      "ip-api",
@@ -162,6 +168,10 @@ func validateConfig(cfg AppConfig) error {
 	}
 	if cfg.JWTExpiryHours < 1 {
 		return errors.New("jwtExpiryHours must be >= 1")
+	}
+	// jwtSecret may still be empty at load time; main enforces non-weak secrets before listen.
+	if cfg.VisitRetentionDays < 0 {
+		return errors.New("visitRetentionDays must be >= 0")
 	}
 	if cfg.Geo.TimeoutMs <= 0 {
 		cfg.Geo.TimeoutMs = 3000

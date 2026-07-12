@@ -70,6 +70,8 @@ export function ReaderPage() {
   const [identity, setIdentity] = useState<CommentIdentity | null>(() => readCommentIdentity());
   const [canDownload, setCanDownload] = useState(false);
   const [unavailable, setUnavailable] = useState('');
+  const [commentsHasMore, setCommentsHasMore] = useState(false);
+  const [loadingMoreComments, setLoadingMoreComments] = useState(false);
   const objectUrlsRef = useRef<string[]>([]);
 
   const replaceLoaded = (next: LoadedTNote | null) => {
@@ -93,13 +95,38 @@ export function ReaderPage() {
     } else {
       replaceLoaded(null);
     }
-    const cl = await blogWS.request<{ comments: Comment[] }>('notes.comments.list', { id });
+    const cl = await blogWS.request<{ comments: Comment[]; hasMore?: boolean }>('notes.comments.list', { id, limit: 30 });
     setComments(cl.comments || []);
+    setCommentsHasMore(Boolean(cl.hasMore));
     void blogWS.request('visit.track', {
       path: `/note/${id}`,
       noteId: id,
       userAgent: navigator.userAgent,
     }).catch(() => undefined);
+  };
+
+  const loadMoreComments = async () => {
+    if (!comments.length || loadingMoreComments) return;
+    setLoadingMoreComments(true);
+    try {
+      const last = comments[comments.length - 1];
+      const cl = await blogWS.request<{ comments: Comment[]; hasMore?: boolean }>('notes.comments.list', {
+        id,
+        limit: 30,
+        beforeCreatedAt: last.createdAt,
+        beforeId: last.id,
+      });
+      setComments((prev) => {
+        const seen = new Set(prev.map((c) => c.id));
+        const extra = (cl.comments || []).filter((c) => !seen.has(c.id));
+        return [...prev, ...extra];
+      });
+      setCommentsHasMore(Boolean(cl.hasMore));
+    } catch (e) {
+      Toast.error(String(e));
+    } finally {
+      setLoadingMoreComments(false);
+    }
   };
 
   useEffect(() => {
@@ -347,6 +374,11 @@ export function ReaderPage() {
                 </div>
               );
             })}
+            {commentsHasMore ? (
+              <Button theme="light" loading={loadingMoreComments} onClick={() => void loadMoreComments()}>
+                加载更多评论
+              </Button>
+            ) : null}
           </div>
         </div>
       </SideSheet>
