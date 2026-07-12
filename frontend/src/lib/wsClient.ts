@@ -1,4 +1,4 @@
-import { solvePow } from './pow';
+import { solvePow, type PowProgress } from './pow';
 
 export type Envelope = {
   v: number;
@@ -164,13 +164,19 @@ export class BlogWS {
     });
   }
 
-  async login(username: string, password: string) {
+  async login(
+    username: string,
+    password: string,
+    options?: { onPowProgress?: (p: PowProgress) => void },
+  ) {
     const challenge = await this.request<{ id: string; salt: string; difficulty: number }>(
       'auth.pow.challenge',
       {},
     );
     // Bound PoW is enforced server-side against this websocket session/IP.
-    const nonce = await solvePow(challenge.salt, challenge.difficulty, {});
+    const nonce = await solvePow(challenge.salt, challenge.difficulty, {
+      onProgress: options?.onPowProgress,
+    });
     const result = await this.request<{
       token: string;
       userId: string;

@@ -719,17 +719,20 @@ type Daily struct {
 }
 
 func (s *Store) GetSiteSettings(ctx context.Context) (*storage.SiteSettings, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT hero_title, hero_subtitle, background_mode, background_path, background_url,
+	row := s.db.QueryRowContext(ctx, `SELECT hero_title, hero_subtitle, COALESCE(nav_title, 'TimeNotes Blog'),
+		background_mode, background_path, background_url,
 		focus_x, focus_y, overlay_color, overlay_opacity, updated_at FROM site_settings WHERE id = 1`)
 	var st storage.SiteSettings
 	if err := row.Scan(
-		&st.HeroTitle, &st.HeroSubtitle, &st.BackgroundMode, &st.BackgroundPath, &st.BackgroundURL,
+		&st.HeroTitle, &st.HeroSubtitle, &st.NavTitle,
+		&st.BackgroundMode, &st.BackgroundPath, &st.BackgroundURL,
 		&st.FocusX, &st.FocusY, &st.OverlayColor, &st.OverlayOpacity, &st.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return &storage.SiteSettings{
 				HeroTitle:      "TimeNotes Blog",
 				HeroSubtitle:   "浏览公开手账本 · 点赞 · 评论",
+				NavTitle:       "TimeNotes Blog",
 				BackgroundMode: "none",
 				FocusX:         50,
 				FocusY:         40,
@@ -740,6 +743,9 @@ func (s *Store) GetSiteSettings(ctx context.Context) (*storage.SiteSettings, err
 		}
 		return nil, err
 	}
+	if strings.TrimSpace(st.NavTitle) == "" {
+		st.NavTitle = "TimeNotes Blog"
+	}
 	return &st, nil
 }
 
@@ -748,13 +754,17 @@ func (s *Store) UpdateSiteSettings(ctx context.Context, st storage.SiteSettings)
 	if st.UpdatedAt == "" {
 		st.UpdatedAt = now
 	}
+	if strings.TrimSpace(st.NavTitle) == "" {
+		st.NavTitle = "TimeNotes Blog"
+	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO site_settings(
-		id, hero_title, hero_subtitle, background_mode, background_path, background_url,
+		id, hero_title, hero_subtitle, nav_title, background_mode, background_path, background_url,
 		focus_x, focus_y, overlay_color, overlay_opacity, updated_at
-	) VALUES (1,?,?,?,?,?,?,?,?,?,?)
+	) VALUES (1,?,?,?,?,?,?,?,?,?,?,?)
 	ON CONFLICT(id) DO UPDATE SET
 		hero_title=excluded.hero_title,
 		hero_subtitle=excluded.hero_subtitle,
+		nav_title=excluded.nav_title,
 		background_mode=excluded.background_mode,
 		background_path=excluded.background_path,
 		background_url=excluded.background_url,
@@ -763,7 +773,7 @@ func (s *Store) UpdateSiteSettings(ctx context.Context, st storage.SiteSettings)
 		overlay_color=excluded.overlay_color,
 		overlay_opacity=excluded.overlay_opacity,
 		updated_at=excluded.updated_at`,
-		st.HeroTitle, st.HeroSubtitle, st.BackgroundMode, st.BackgroundPath, st.BackgroundURL,
+		st.HeroTitle, st.HeroSubtitle, st.NavTitle, st.BackgroundMode, st.BackgroundPath, st.BackgroundURL,
 		st.FocusX, st.FocusY, st.OverlayColor, st.OverlayOpacity, st.UpdatedAt,
 	)
 	return err

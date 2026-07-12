@@ -230,6 +230,7 @@ func (h *Hub) RegisterRoutes(app *fiber.App) {
 	app.Get("/files/:token", h.handleDownload)
 	app.Get("/covers/:id", h.handleCover)
 	app.Get("/site/background", h.handleSiteBackground)
+	app.Post("/api/site/background/upload", h.handleSiteBackgroundHTTPUpload)
 
 	app.Use("/ws", func(c fiber.Ctx) error {
 		if !websocket.IsWebSocketUpgrade(c) {
@@ -1762,13 +1763,32 @@ u.PasswordHash = ""
 		cs.replyOK(protocol.TypeAdminStats, env.ID, stats)
 	}
 
+func mediaTypeFromPathOrURL(pathOrURL string) string {
+	lower := strings.ToLower(pathOrURL)
+	switch {
+	case strings.HasSuffix(lower, ".mp4"), strings.Contains(lower, ".mp4?"):
+		return "video"
+	case strings.HasSuffix(lower, ".webm"), strings.Contains(lower, ".webm?"):
+		return "video"
+	case strings.HasSuffix(lower, ".mov"), strings.Contains(lower, ".mov?"):
+		return "video"
+	default:
+		return "image"
+	}
+}
+
 func (h *Hub) publicSiteSettings(st *storage.SiteSettings) map[string]any {
 	if st == nil {
 		return map[string]any{}
 	}
+	navTitle := strings.TrimSpace(st.NavTitle)
+	if navTitle == "" {
+		navTitle = "TimeNotes Blog"
+	}
 	out := map[string]any{
 		"heroTitle":      st.HeroTitle,
 		"heroSubtitle":   st.HeroSubtitle,
+		"navTitle":       navTitle,
 		"backgroundMode": st.BackgroundMode,
 		"backgroundUrl":  st.BackgroundURL,
 		"focusX":         st.FocusX,
@@ -1777,10 +1797,15 @@ func (h *Hub) publicSiteSettings(st *storage.SiteSettings) map[string]any {
 		"overlayOpacity": st.OverlayOpacity,
 		"updatedAt":      st.UpdatedAt,
 	}
+	mediaType := "image"
 	if st.BackgroundMode == "upload" && strings.TrimSpace(st.BackgroundPath) != "" {
-		// cache-bust when settings change so browsers pick up the new image
+		// cache-bust when settings change so browsers pick up the new media
 		out["backgroundAssetUrl"] = "/site/background?v=" + url.QueryEscape(st.UpdatedAt)
+		mediaType = mediaTypeFromPathOrURL(st.BackgroundPath)
+	} else if st.BackgroundMode == "url" && strings.TrimSpace(st.BackgroundURL) != "" {
+		mediaType = mediaTypeFromPathOrURL(st.BackgroundURL)
 	}
+	out["backgroundMediaType"] = mediaType
 	return out
 }
 
@@ -1845,6 +1870,7 @@ func (cs *clientSession) handleAdminSiteUpdate(ctx context.Context, env protocol
 	payload, err := protocol.DecodePayload[struct {
 		HeroTitle      *string  `json:"heroTitle"`
 		HeroSubtitle   *string  `json:"heroSubtitle"`
+		NavTitle       *string  `json:"navTitle"`
 		BackgroundMode *string  `json:"backgroundMode"`
 		BackgroundURL  *string  `json:"backgroundUrl"`
 		FocusX         *float64 `json:"focusX"`
@@ -1880,6 +1906,17 @@ func (cs *clientSession) handleAdminSiteUpdate(ctx context.Context, env protocol
 			return
 		}
 		cur.HeroSubtitle = sub
+	}
+	if payload.NavTitle != nil {
+		nav := strings.TrimSpace(*payload.NavTitle)
+		if nav == "" {
+			nav = "TimeNotes Blog"
+		}
+		if len(nav) > 80 {
+			cs.replyErr(env.ID, "bad_request", "nav title too long")
+			return
+		}
+		cur.NavTitle = nav
 	}
 	if payload.BackgroundMode != nil {
 		mode := strings.ToLower(strings.TrimSpace(*payload.BackgroundMode))
@@ -1968,57 +2005,133 @@ func (cs *clientSession) handleAdminSiteBgUpload(ctx context.Context, env protoc
 		cs.replyErr(env.ID, "bad_request", "invalid base64")
 		return
 	}
+	// WS base64 path is for small images only; videos should use HTTP upload.
 	const maxHeroBytes = 5 * 1024 * 1024
 	if len(data) == 0 || int64(len(data)) > maxHeroBytes {
-		cs.replyErr(env.ID, "bad_request", "image must be 1B–5MB")
+		cs.replyErr(env.ID, "bad_request", "media too large for WS upload; use file upload API (images ≤5MB, videos use HTTP)")
 		return
 	}
-	// Reject HTML/SVG disguises early.
-	lower := strings.ToLower(string(data[:min(len(data), 256)]))
-	if strings.Contains(lower, "<svg") || strings.Contains(lower, "<html") || strings.Contains(lower, "<!doctype") {
-		cs.replyErr(env.ID, "bad_request", "svg/html not allowed")
-		return
-	}
-	ext, mime, err := validateThumbnailImage(data, 8192*8192)
+	ext, mime, kind, err := validateHeroMedia(data)
 	if err != nil {
-		cs.replyErr(env.ID, "bad_request", "invalid image: must be png/jpg/webp/gif")
+		cs.replyErr(env.ID, "bad_request", err.Error())
 		return
 	}
 	_ = mime
-	cur, err := cs.hub.store.GetSiteSettings(ctx)
-	if err != nil {
-		cs.replyErr(env.ID, "db_error", "site settings failed")
+	if kind == "video" {
+		cs.replyErr(env.ID, "bad_request", "video must be uploaded via HTTP /api/site/background/upload")
 		return
 	}
+	pub, err := cs.hub.commitSiteBackground(ctx, data, ext)
+	if err != nil {
+		cs.replyErr(env.ID, "io_error", err.Error())
+		return
+	}
+	cs.replyOK(protocol.TypeAdminSiteBgUpload, env.ID, map[string]any{
+		"settings": pub,
+		"name":     payload.Name,
+	})
+}
+
+func validateHeroMedia(data []byte) (ext, mime, kind string, err error) {
+	if len(data) < 12 {
+		return "", "", "", errors.New("file too small")
+	}
+	head := strings.ToLower(string(data[:min(len(data), 256)]))
+	if strings.Contains(head, "<svg") || strings.Contains(head, "<html") || strings.Contains(head, "<!doctype") {
+		return "", "", "", errors.New("svg/html not allowed")
+	}
+	if e, m, e2 := validateThumbnailImage(data, 8192*8192); e2 == nil {
+		return e, m, "image", nil
+	}
+	// MP4 / ISO BMFF: ....ftyp
+	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
+		return ".mp4", "video/mp4", "video", nil
+	}
+	// WebM / Matroska EBML header 0x1A45DFA3
+	if data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3 {
+		return ".webm", "video/webm", "video", nil
+	}
+	return "", "", "", errors.New("invalid media: use png/jpg/webp/gif or mp4/webm")
+}
+
+func (h *Hub) commitSiteBackground(ctx context.Context, data []byte, ext string) (map[string]any, error) {
+	cur, err := h.store.GetSiteSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
 	oldPath := cur.BackgroundPath
-	dest := filepath.Join(cs.hub.opts.SiteDir, "hero"+ext)
+	dest := filepath.Join(h.opts.SiteDir, "hero"+ext)
 	tmp := dest + ".part"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		cs.replyErr(env.ID, "io_error", "write failed")
-		return
+		return nil, errors.New("write failed")
 	}
 	if err := os.Rename(tmp, dest); err != nil {
 		_ = os.Remove(tmp)
-		cs.replyErr(env.ID, "io_error", "commit failed")
-		return
+		return nil, errors.New("commit failed")
 	}
-	// Remove previous file if extension changed.
 	if oldPath != "" && oldPath != dest {
 		_ = os.Remove(oldPath)
 	}
 	cur.BackgroundPath = dest
 	cur.BackgroundMode = "upload"
 	cur.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	if err := cs.hub.store.UpdateSiteSettings(ctx, *cur); err != nil {
-		cs.replyErr(env.ID, "db_error", "update site settings failed")
-		return
+	if err := h.store.UpdateSiteSettings(ctx, *cur); err != nil {
+		return nil, errors.New("update site settings failed")
 	}
-	pub := cs.hub.publicSiteSettings(cur)
-	cs.hub.events.broadcast(protocol.TypeEventSiteSettingsChanged, map[string]any{"settings": pub}, audienceAll)
-	cs.replyOK(protocol.TypeAdminSiteBgUpload, env.ID, map[string]any{
-		"settings": pub,
-		"name":     payload.Name,
-	})
+	pub := h.publicSiteSettings(cur)
+	h.events.broadcast(protocol.TypeEventSiteSettingsChanged, map[string]any{"settings": pub}, audienceAll)
+	return pub, nil
+}
+
+func (h *Hub) handleSiteBackgroundHTTPUpload(c fiber.Ctx) error {
+	authz := c.Get("Authorization")
+	token := strings.TrimSpace(strings.TrimPrefix(authz, "Bearer "))
+	if token == "" {
+		token = strings.TrimSpace(c.Get("X-Admin-Token"))
+	}
+	if token == "" {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	claims, err := auth.ParseJWT(h.opts.JWTSecret, token)
+	if err != nil || claims == nil || claims.Role != "admin" {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	u, err := h.store.GetUserByID(c.Context(), claims.UserID)
+	if err != nil || u == nil || u.Role != "admin" {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+
+	file, err := c.FormFile("file")
+	if err != nil || file == nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "file required"})
+	}
+	const maxVideo = 80 * 1024 * 1024
+	if file.Size <= 0 || file.Size > maxVideo {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "file must be 1B–80MB"})
+	}
+	f, err := file.Open()
+	if err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "open failed"})
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxVideo+1))
+	if err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "read failed"})
+	}
+	if int64(len(data)) > maxVideo {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "file too large"})
+	}
+	ext, mime, kind, err := validateHeroMedia(data)
+	if err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	_ = mime
+	_ = kind
+	pub, err := h.commitSiteBackground(c.Context(), data, ext)
+	if err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"settings": pub})
 }
 
 	func (cs *clientSession) handleEventsSubscribe(env protocol.Envelope) {
@@ -2123,6 +2236,12 @@ func (h *Hub) handleSiteBackground(c fiber.Ctx) error {
 		c.Set("Content-Type", "image/webp")
 	case ".gif":
 		c.Set("Content-Type", "image/gif")
+	case ".mp4":
+		c.Set("Content-Type", "video/mp4")
+	case ".webm":
+		c.Set("Content-Type", "video/webm")
+	case ".mov":
+		c.Set("Content-Type", "video/quicktime")
 	default:
 		c.Set("Content-Type", "image/png")
 	}
@@ -2173,7 +2292,7 @@ func MountStatic(app *fiber.App, webDir, adminToken string) {
 
 	app.Get("/*", func(c fiber.Ctx) error {
 		path := c.Path()
-		if strings.HasPrefix(path, "/ws") || strings.HasPrefix(path, "/files/") || strings.HasPrefix(path, "/covers/") || strings.HasPrefix(path, "/site/") || path == "/healthz" {
+		if strings.HasPrefix(path, "/ws") || strings.HasPrefix(path, "/files/") || strings.HasPrefix(path, "/covers/") || strings.HasPrefix(path, "/site/") || strings.HasPrefix(path, "/api/") || path == "/healthz" {
 			return fiber.ErrNotFound
 		}
 		if strings.HasPrefix(path, "/admin/") {

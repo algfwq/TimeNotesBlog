@@ -3,13 +3,20 @@ import { Button, Typography } from '@douyinfe/semi-ui';
 import { IconBook } from '@douyinfe/semi-icons';
 import { ThemeToggle } from './ThemeToggle';
 
-export function PublicNav({ compact = false }: { compact?: boolean }) {
+export function PublicNav({
+  compact = false,
+  brandTitle = 'TimeNotes Blog',
+}: {
+  compact?: boolean;
+  brandTitle?: string;
+}) {
   const navigate = useNavigate();
+  const title = brandTitle.trim() || 'TimeNotes Blog';
   return (
     <header className={`public-nav ${compact ? 'public-nav--compact' : ''}`}>
       <button type="button" className="public-nav-brand" onClick={() => navigate('/')}>
         <IconBook size="large" />
-        <Typography.Text strong>TimeNotes Blog</Typography.Text>
+        <Typography.Text strong>{title}</Typography.Text>
       </button>
       <div className="public-nav-actions">
         <ThemeToggle />

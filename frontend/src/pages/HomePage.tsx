@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Empty, Spin, Typography } from '@douyinfe/semi-ui';
 import { IconBook, IconComment, IconDownload, IconLikeThumb } from '@douyinfe/semi-icons';
 import { blogWS } from '../lib/wsClient';
 import { PublicNav } from '../components/PublicNav';
-import { defaultSiteSettings, resolveHeroBackground, type SiteSettings } from '../types/site';
+import { rememberHomeScroll, restoreHomeScroll } from '../lib/homeScroll';
+import { defaultSiteSettings, isHeroVideo, resolveHeroBackground, type SiteSettings } from '../types/site';
 
 type Note = {
   id: string;
@@ -39,7 +40,13 @@ export function HomePage() {
   const [error, setError] = useState('');
   const [brokenCovers, setBrokenCovers] = useState<Record<string, boolean>>({});
   const [scrolledPastHero, setScrolledPastHero] = useState(false);
+  const restoredScrollRef = useRef(false);
   const navigate = useNavigate();
+
+  const openNote = (id: string) => {
+    rememberHomeScroll(id);
+    navigate(`/note/${id}`);
+  };
 
   const loadNotes = async () => {
     await blogWS.connect();
@@ -74,6 +81,15 @@ export function HomePage() {
       cancelled = true;
     };
   }, []);
+
+  // After notes/settings finish loading, jump back to the pre-reader scroll offset.
+  useLayoutEffect(() => {
+    if (loading || restoredScrollRef.current) return;
+    restoredScrollRef.current = true;
+    if (restoreHomeScroll()) {
+      setScrolledPastHero(window.scrollY > window.innerHeight * 0.55);
+    }
+  }, [loading, notes.length]);
 
   useEffect(() => {
     const onScroll = () => {
@@ -147,26 +163,45 @@ export function HomePage() {
   }, []);
 
   const heroBg = useMemo(() => resolveHeroBackground(settings), [settings]);
+  const heroVideo = isHeroVideo(settings);
   const overlay = hexToRgba(settings.overlayColor || '#0b0d12', Number(settings.overlayOpacity ?? 0.45));
+  const focusPos = `${settings.focusX}% ${settings.focusY}%`;
 
   return (
     <div className="home-page">
       <div className={`home-sticky-nav ${scrolledPastHero ? 'is-visible' : ''}`}>
-        <PublicNav compact />
+        <PublicNav compact brandTitle={settings.navTitle || settings.heroTitle || 'TimeNotes Blog'} />
       </div>
 
       <section
         className="home-hero"
-        style={{
-          backgroundImage: heroBg
-            ? `linear-gradient(${overlay}, ${overlay}), url(${heroBg})`
-            : undefined,
-          backgroundPosition: `${settings.focusX}% ${settings.focusY}%`,
-        }}
+        style={
+          heroBg && !heroVideo
+            ? {
+                backgroundImage: `url(${heroBg})`,
+                backgroundPosition: focusPos,
+              }
+            : undefined
+        }
       >
+        {heroBg && heroVideo ? (
+          <video
+            key={heroBg}
+            className="home-hero-video"
+            src={heroBg}
+            autoPlay
+            muted
+            loop
+            playsInline
+            // silent wallpaper: no controls, no audio
+            controls={false}
+            style={{ objectPosition: focusPos }}
+          />
+        ) : null}
+        <div className="home-hero-overlay" style={{ background: overlay }} />
         <div className="home-hero-inner">
           <div className="home-hero-top">
-            <PublicNav />
+            <PublicNav brandTitle={settings.navTitle || settings.heroTitle || 'TimeNotes Blog'} />
           </div>
           <div className="home-hero-content">
             <div className="home-hero-badge">
@@ -214,7 +249,7 @@ export function HomePage() {
                   key={note.id}
                   type="button"
                   className="note-card glass-panel"
-                  onClick={() => navigate(`/note/${note.id}`)}
+                  onClick={() => openNote(note.id)}
                 >
                   <div className="note-cover">
                     {broken ? (

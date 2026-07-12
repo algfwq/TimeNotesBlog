@@ -112,6 +112,7 @@ type CountryCount struct {
 type SiteSettings struct {
 	HeroTitle       string  `json:"heroTitle"`
 	HeroSubtitle    string  `json:"heroSubtitle"`
+	NavTitle        string  `json:"navTitle"` // public nav brand title
 	BackgroundMode  string  `json:"backgroundMode"` // none | url | upload
 	BackgroundPath  string  `json:"-"`
 	BackgroundURL   string  `json:"backgroundUrl"`

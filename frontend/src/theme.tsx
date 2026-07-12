@@ -6,6 +6,7 @@ export type ThemeMode = 'light' | 'dark';
 
 const COOKIE_KEY = 'tn_blog_theme';
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
+const THEME_ANIM_MS = 420;
 
 type ThemeContextValue = {
   mode: ThemeMode;
@@ -44,6 +45,47 @@ export function applyThemeMode(mode: ThemeMode) {
   document.body.dataset.theme = mode;
 }
 
+function clearThemeAnimClass() {
+  document.documentElement.classList.remove('theme-animating');
+  document.body.classList.remove('theme-animating');
+}
+
+/** Cross-fade / view-transition between light and dark. */
+function runThemeChange(next: ThemeMode, commit: () => void) {
+  const root = document.documentElement;
+  const apply = () => {
+    applyThemeMode(next);
+    commit();
+  };
+
+  // Prefer native View Transitions when available (Chrome/Edge).
+  const doc = document as Document & {
+    startViewTransition?: (cb: () => void) => { finished: Promise<void> };
+  };
+  if (typeof doc.startViewTransition === 'function') {
+    try {
+      root.classList.add('theme-animating');
+      const vt = doc.startViewTransition(() => {
+        apply();
+      });
+      void vt.finished.finally(() => {
+        clearThemeAnimClass();
+      });
+      return;
+    } catch {
+      // fall through
+    }
+  }
+
+  // CSS fallback: brief class enables color/background transitions.
+  root.classList.add('theme-animating');
+  document.body.classList.add('theme-animating');
+  // Force style flush so transitions run from previous theme values.
+  void root.offsetWidth;
+  apply();
+  window.setTimeout(clearThemeAnimClass, THEME_ANIM_MS);
+}
+
 /** @deprecated Use ThemeProvider + useTheme. Kept for transitional callers. */
 export function applyDarkTheme() {
   applyThemeMode('dark');
@@ -54,14 +96,19 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const [mode, setModeState] = useState<ThemeMode>(initial.mode);
   const [source, setSource] = useState<'system' | 'user'>(initial.source);
 
+  // Initial mount: apply without animation.
   useEffect(() => {
     applyThemeMode(mode);
-  }, [mode]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (source !== 'system') return;
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
-    const onChange = () => setModeState(mq.matches ? 'dark' : 'light');
+    const onChange = () => {
+      const next: ThemeMode = mq.matches ? 'dark' : 'light';
+      runThemeChange(next, () => setModeState(next));
+    };
     mq.addEventListener('change', onChange);
     return () => mq.removeEventListener('change', onChange);
   }, [source]);
@@ -69,8 +116,12 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const setMode = useCallback((next: ThemeMode) => {
     writeCookie(COOKIE_KEY, next);
     setSource('user');
-    setModeState(next);
-  }, []);
+    if (next === mode) {
+      applyThemeMode(next);
+      return;
+    }
+    runThemeChange(next, () => setModeState(next));
+  }, [mode]);
 
   const toggle = useCallback(() => {
     setMode(mode === 'dark' ? 'light' : 'dark');

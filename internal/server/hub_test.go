@@ -177,7 +177,7 @@ func (s *stubStore) GetVisitStats(ctx context.Context, recentDays int) (*storage
 }
 func (s *stubStore) GetSiteSettings(ctx context.Context) (*storage.SiteSettings, error) {
 	return &storage.SiteSettings{
-		HeroTitle: "TimeNotes Blog", HeroSubtitle: "sub", BackgroundMode: "none",
+		HeroTitle: "TimeNotes Blog", HeroSubtitle: "sub", NavTitle: "TimeNotes Blog", BackgroundMode: "none",
 		FocusX: 50, FocusY: 40, OverlayColor: "#0b0d12", OverlayOpacity: 0.45,
 	}, nil
 }

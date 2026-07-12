@@ -40,10 +40,11 @@ async function solve(msg: SolveMessage) {
     // Must match server: SHA-256(salt + nonce), leading zero bits.
     const digest = await crypto.subtle.digest('SHA-256', encoder.encode(msg.salt + nonce));
     if (leadingZeroBits(new Uint8Array(digest)) >= msg.difficulty) {
-      (self as DedicatedWorkerGlobalScope).postMessage({ type: 'done', nonce });
+      (self as DedicatedWorkerGlobalScope).postMessage({ type: 'done', nonce, attempts: i + 1 });
       return;
     }
-    if (i > 0 && i % 25000 === 0) {
+    // Emit more often for smooth UI progress (every ~4k hashes).
+    if (i > 0 && i % 4000 === 0) {
       (self as DedicatedWorkerGlobalScope).postMessage({ type: 'progress', attempts: i });
       await new Promise((resolve) => setTimeout(resolve, 0));
     }

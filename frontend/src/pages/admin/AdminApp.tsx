@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
-  Button, Checkbox, Empty, Input, Modal, Select, Slider, Switch, Tag,
+  Button, Checkbox, ColorPicker, Empty, Input, Modal, Progress, Select, Slider, Switch, Tag,
   Table, Toast, Typography, Upload,
 } from '@douyinfe/semi-ui';
 import {
@@ -9,11 +9,13 @@ import {
 } from '@douyinfe/semi-icons';
 import { VChart } from '@visactor/react-vchart';
 import { blogWS } from '../../lib/wsClient';
+import type { PowProgress } from '../../lib/pow';
 import { useTheme } from '../../theme';
 import { ThemeToggle } from '../../components/ThemeToggle';
 import { AdminCredentialMigrationModal } from '../../components/AdminCredentialMigrationModal';
 import { WorldMapChart } from '../../components/WorldMapChart';
-import { defaultSiteSettings, resolveHeroBackground, type SiteSettings } from '../../types/site';
+import { defaultSiteSettings, isHeroVideo, resolveHeroBackground, type SiteSettings } from '../../types/site';
+import logoUrl from '../../assets/timenotes-logo.png';
 import './admin.css';
 
 type User = {
@@ -97,6 +99,8 @@ export function AdminApp() {
   const [navKey, setNavKey] = useState('dash');
   const [selfForm, setSelfForm] = useState({ username: '', password: '', password2: '' });
   const [selfSaving, setSelfSaving] = useState(false);
+  const [powProgress, setPowProgress] = useState<PowProgress | null>(null);
+  const [uploadingHero, setUploadingHero] = useState(false);
 
   const mapError = (e: unknown) => {
     const msg = String(e);
@@ -130,17 +134,34 @@ export function AdminApp() {
 
   const login = async () => {
     setBusy(true);
+    const startedAt = Date.now();
+    setPowProgress({ attempts: 0, difficulty: 0, percent: 2, status: 'solving' });
     try {
       await blogWS.connect();
-      const res = await blogWS.login(username, password);
+      const res = await blogWS.login(username, password, {
+        onPowProgress: (p) => setPowProgress(p),
+      });
       if (res.role !== 'admin') throw new Error('需要管理员账号');
+      setPowProgress((p) => ({
+        attempts: p?.attempts ?? 0,
+        difficulty: p?.difficulty ?? 0,
+        percent: 100,
+        status: 'done',
+      }));
+      // Keep the progress panel visible long enough for users to notice (easy challenges finish in ms).
+      const remain = Math.max(0, 700 - (Date.now() - startedAt));
+      if (remain > 0) {
+        await new Promise((r) => window.setTimeout(r, remain));
+      }
       applySession(res);
       Toast.success('登录成功');
       if (!res.mustChangeCredentials) await refreshAll();
     } catch (e) {
+      setPowProgress((p) => (p ? { ...p, status: 'error' } : { attempts: 0, difficulty: 0, percent: 0, status: 'error' }));
       Toast.error(mapError(e));
     } finally {
       setBusy(false);
+      window.setTimeout(() => setPowProgress(null), 400);
     }
   };
 
@@ -366,6 +387,7 @@ export function AdminApp() {
       const res = await blogWS.request<{ settings: SiteSettings }>('admin.site.update', {
         heroTitle: settingsDraft.heroTitle,
         heroSubtitle: settingsDraft.heroSubtitle,
+        navTitle: settingsDraft.navTitle,
         backgroundMode: settingsDraft.backgroundMode,
         backgroundUrl: settingsDraft.backgroundUrl || '',
         focusX: settingsDraft.focusX,
@@ -385,19 +407,55 @@ export function AdminApp() {
   };
 
   const uploadHero = async (file: File) => {
-    const buf = await file.arrayBuffer();
-    const bytes = new Uint8Array(buf);
-    let binary = '';
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-    const data = btoa(binary);
-    const res = await blogWS.request<{ settings: SiteSettings }>('admin.site.background.upload', {
-      data,
-      name: file.name,
-    }, 60000);
-    const next = { ...defaultSiteSettings(), ...(res.settings || {}) };
-    setSettings(next);
-    setSettingsDraft(next);
-    Toast.success('背景图已上传');
+    setUploadingHero(true);
+    try {
+      const isVideo = /^video\//i.test(file.type) || /\.(mp4|webm|mov)$/i.test(file.name);
+      // Prefer HTTP for all hero media (supports large video wallpapers).
+      const form = new FormData();
+      form.append('file', file);
+      const resp = await fetch(`${location.origin}/api/site/background/upload`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${blogWS.getToken() || token}`,
+        },
+        body: form,
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        let msg = text;
+        try {
+          const j = JSON.parse(text) as { error?: string };
+          if (j.error) msg = j.error;
+        } catch {
+          // keep text
+        }
+        // Fallback: small images via WS base64 path.
+        if (!isVideo && file.size <= 4 * 1024 * 1024) {
+          const buf = await file.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          let binary = '';
+          for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+          const data = btoa(binary);
+          const res = await blogWS.request<{ settings: SiteSettings }>('admin.site.background.upload', {
+            data,
+            name: file.name,
+          }, 60000);
+          const next = { ...defaultSiteSettings(), ...(res.settings || {}) };
+          setSettings(next);
+          setSettingsDraft(next);
+          Toast.success(isVideo ? '背景视频已上传' : '背景图已上传');
+          return;
+        }
+        throw new Error(msg || `upload failed (${resp.status})`);
+      }
+      const body = await resp.json() as { settings?: SiteSettings };
+      const next = { ...defaultSiteSettings(), ...(body.settings || {}) };
+      setSettings(next);
+      setSettingsDraft(next);
+      Toast.success(isVideo ? '背景视频已上传（静默循环播放）' : '背景图已上传');
+    } finally {
+      setUploadingHero(false);
+    }
   };
 
   const saveSelf = async () => {
@@ -436,28 +494,39 @@ export function AdminApp() {
     return `rgba(${r},${g},${b},${settingsDraft.overlayOpacity})`;
   }, [settingsDraft]);
 
+  const overlayColorValue = useMemo(() => {
+    try {
+      return ColorPicker.colorStringToValue(settingsDraft.overlayColor || '#0b0d12');
+    } catch {
+      return ColorPicker.colorStringToValue('#0b0d12');
+    }
+  }, [settingsDraft.overlayColor]);
+
   if (!authed) {
     return (
       <div className="admin-app admin-login">
         <div className="admin-login-shell">
           <div className="admin-login-brand">
             <div>
-              <div className="admin-login-mark"><IconBook /></div>
-              <h1>TimeNotes<br />管理控制台</h1>
-              <p>管理公开手账、用户权限、站点外观与访问统计。登录包含 PoW 工作量验证，请使用管理员账号。</p>
+              <div className="admin-login-mark admin-login-mark--logo">
+                <img src={logoUrl} alt="TimeNotes" draggable={false} />
+              </div>
+              <h1>TimeNotes Blog</h1>
+              <p>TimeNotes 手账本的公开展示与协作上传服务。管理员在此管理手账、用户与站点外观。</p>
               <div className="admin-login-pills">
-                <span className="admin-login-pill">PoW 防爆破</span>
-                <span className="admin-login-pill">JWT 会话</span>
-                <span className="admin-login-pill">实时事件</span>
+                <span className="admin-login-pill">公开浏览 · 点赞评论</span>
+                <span className="admin-login-pill">客户端上传</span>
+                <span className="admin-login-pill">用户与权限</span>
+                <span className="admin-login-pill">PoW + JWT 登录</span>
               </div>
             </div>
-            <div className="admin-login-foot">TimeNotes Blog Admin · 仅授权人员访问</div>
+            <div className="admin-login-foot">仅授权管理员 · 首次请尽快修改默认密码</div>
           </div>
           <div className="admin-login-form">
             <div className="admin-login-form-top">
               <div>
                 <h2>欢迎回来</h2>
-                <p className="hint">输入管理员凭据以进入后台</p>
+                <p className="hint">管理员登录（含 PoW 工作量验证）</p>
               </div>
               <ThemeToggle size="small" />
             </div>
@@ -478,8 +547,33 @@ export function AdminApp() {
                   onEnterPress={login}
                 />
               </div>
+              {powProgress ? (
+                <div className={`admin-pow-panel ${powProgress.status}`}>
+                  <div className="admin-pow-head">
+                    <span className="admin-pow-spinner" aria-hidden />
+                    <div>
+                      <div className="admin-pow-title">
+                        {powProgress.status === 'done'
+                          ? 'PoW 验证完成'
+                          : powProgress.status === 'error'
+                            ? 'PoW 验证失败'
+                            : '正在计算 PoW 验证码…'}
+                      </div>
+                      <div className="admin-pow-sub">
+                        难度 {powProgress.difficulty || '…'} bit · 尝试 {powProgress.attempts.toLocaleString()} 次
+                      </div>
+                    </div>
+                  </div>
+                  <Progress
+                    percent={powProgress.percent}
+                    showInfo
+                    stroke={powProgress.status === 'error' ? 'var(--semi-color-danger)' : undefined}
+                    aria-label="PoW progress"
+                  />
+                </div>
+              ) : null}
               <Button className="admin-login-submit" theme="solid" type="primary" loading={busy} onClick={login} block>
-                登录后台
+                {busy ? '验证中…' : '登录后台'}
               </Button>
             </div>
           </div>
@@ -498,7 +592,9 @@ export function AdminApp() {
       <div className="admin-shell">
         <aside className="admin-sidebar">
           <div className="admin-brand">
-            <div className="admin-brand-mark"><IconBook /></div>
+            <div className="admin-brand-mark admin-brand-mark--logo">
+              <img src={logoUrl} alt="TimeNotes" draggable={false} />
+            </div>
             <div className="admin-brand-text">
               <div className="admin-brand-title">TimeNotes</div>
               <div className="admin-brand-sub">Admin Console</div>
@@ -910,6 +1006,14 @@ export function AdminApp() {
                   <div className="admin-panel-body">
                     <div className="admin-form-stack">
                       <div>
+                        <label className="field-label">导航栏标题</label>
+                        <Input
+                          value={settingsDraft.navTitle}
+                          onChange={(v) => setSettingsDraft((s) => ({ ...s, navTitle: v }))}
+                          placeholder="TimeNotes Blog"
+                        />
+                      </div>
+                      <div>
                         <label className="field-label">Hero 标题</label>
                         <Input value={settingsDraft.heroTitle} onChange={(v) => setSettingsDraft((s) => ({ ...s, heroTitle: v }))} />
                       </div>
@@ -924,23 +1028,23 @@ export function AdminApp() {
                           value={settingsDraft.backgroundMode}
                           optionList={[
                             { value: 'none', label: '默认渐变' },
-                            { value: 'url', label: '图片 URL' },
-                            { value: 'upload', label: '上传图片' },
+                            { value: 'url', label: '图片 / 视频 URL' },
+                            { value: 'upload', label: '上传图片或视频' },
                           ]}
                           onChange={(v) => setSettingsDraft((s) => ({ ...s, backgroundMode: String(v) as SiteSettings['backgroundMode'] }))}
                         />
                       </div>
                       {settingsDraft.backgroundMode === 'url' ? (
                         <div>
-                          <label className="field-label">背景 URL（https）</label>
-                          <Input value={settingsDraft.backgroundUrl || ''} onChange={(v) => setSettingsDraft((s) => ({ ...s, backgroundUrl: v }))} placeholder="https://..." />
+                          <label className="field-label">背景 URL（https，支持图片或 mp4/webm）</label>
+                          <Input value={settingsDraft.backgroundUrl || ''} onChange={(v) => setSettingsDraft((s) => ({ ...s, backgroundUrl: v }))} placeholder="https://.../hero.mp4" />
                         </div>
                       ) : null}
                       {settingsDraft.backgroundMode === 'upload' ? (
-                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
                           <Upload
                             action=""
-                            accept="image/png,image/jpeg,image/webp,image/gif"
+                            accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm"
                             showUploadList={false}
                             customRequest={async ({ file, onSuccess, onError }) => {
                               try {
@@ -953,7 +1057,7 @@ export function AdminApp() {
                               }
                             }}
                           >
-                            <Button theme="solid" type="primary">上传背景图</Button>
+                            <Button theme="solid" type="primary" loading={uploadingHero}>上传背景媒体</Button>
                           </Upload>
                           <Button
                             type="danger"
@@ -971,6 +1075,9 @@ export function AdminApp() {
                           >
                             清除上传
                           </Button>
+                          <Typography.Text type="tertiary" style={{ fontSize: 12 }}>
+                            视频将作为动态壁纸静默循环播放（≤80MB，mp4/webm）
+                          </Typography.Text>
                         </div>
                       ) : null}
                       <div>
@@ -983,7 +1090,23 @@ export function AdminApp() {
                       </div>
                       <div>
                         <label className="field-label">遮罩颜色</label>
-                        <Input value={settingsDraft.overlayColor} onChange={(v) => setSettingsDraft((s) => ({ ...s, overlayColor: v }))} placeholder="#0b0d12" />
+                        <div className="admin-color-row">
+                          <ColorPicker
+                            usePopover
+                            alpha={false}
+                            value={overlayColorValue}
+                            onChange={(v) => {
+                              const hex = (v.hex || '#0b0d12').slice(0, 7);
+                              setSettingsDraft((s) => ({ ...s, overlayColor: hex }));
+                            }}
+                          />
+                          <Input
+                            style={{ maxWidth: 140 }}
+                            value={settingsDraft.overlayColor}
+                            onChange={(v) => setSettingsDraft((s) => ({ ...s, overlayColor: v }))}
+                            placeholder="#0b0d12"
+                          />
+                        </div>
                       </div>
                       <div>
                         <label className="field-label">遮罩透明度 ({settingsDraft.overlayOpacity.toFixed(2)})</label>
@@ -1003,25 +1126,42 @@ export function AdminApp() {
                 <section className="admin-panel">
                   <div className="admin-panel-head">
                     <h3>实时预览</h3>
-                    <Tag size="small" color="grey">{settings.backgroundMode}</Tag>
+                    <Tag size="small" color="grey">
+                      {settings.backgroundMode}
+                      {isHeroVideo(settingsDraft) ? ' · video' : ''}
+                    </Tag>
                   </div>
                   <div className="admin-panel-body">
                     <div
                       className="site-preview"
                       style={{
-                        backgroundImage: heroPreview
-                          ? `linear-gradient(${heroOverlay}, ${heroOverlay}), url(${heroPreview})`
+                        backgroundImage: heroPreview && !isHeroVideo(settingsDraft)
+                          ? `url(${heroPreview})`
                           : undefined,
                         backgroundPosition: `${settingsDraft.focusX}% ${settingsDraft.focusY}%`,
                       }}
                     >
-                      <div>
+                      {heroPreview && isHeroVideo(settingsDraft) ? (
+                        <video
+                          className="site-preview-video"
+                          src={heroPreview}
+                          autoPlay
+                          muted
+                          loop
+                          playsInline
+                          controls={false}
+                          style={{ objectPosition: `${settingsDraft.focusX}% ${settingsDraft.focusY}%` }}
+                        />
+                      ) : null}
+                      <div className="site-preview-overlay" style={{ background: heroOverlay }} />
+                      <div className="site-preview-copy">
                         <div className="site-preview-title">{settingsDraft.heroTitle}</div>
                         <div className="site-preview-sub">{settingsDraft.heroSubtitle}</div>
                       </div>
                     </div>
                     <Typography.Text type="tertiary" style={{ display: 'block', marginTop: 12, fontSize: 12 }}>
                       线上：{settings.heroTitle} · 模式 {settings.backgroundMode}
+                      {settings.backgroundMediaType ? ` · ${settings.backgroundMediaType}` : ''}
                     </Typography.Text>
                   </div>
                 </section>
