@@ -175,6 +175,15 @@ func (s *stubStore) BackfillVisitGeo(ctx context.Context, ipHash string, info st
 func (s *stubStore) GetVisitStats(ctx context.Context, recentDays int) (*storage.VisitStats, error) {
 	return &storage.VisitStats{}, nil
 }
+func (s *stubStore) GetSiteSettings(ctx context.Context) (*storage.SiteSettings, error) {
+	return &storage.SiteSettings{
+		HeroTitle: "TimeNotes Blog", HeroSubtitle: "sub", BackgroundMode: "none",
+		FocusX: 50, FocusY: 40, OverlayColor: "#0b0d12", OverlayOpacity: 0.45,
+	}, nil
+}
+func (s *stubStore) UpdateSiteSettings(ctx context.Context, st storage.SiteSettings) error {
+	return nil
+}
 
 type fakeCtx struct {
 	ip  string

@@ -32,6 +32,7 @@ type Options struct {
 	Addr                     string
 	NotesDir                 string
 	CoversDir                string
+	SiteDir                  string
 	JWTSecret                string
 	PasswordPepper           string
 	IPHashPepper             string
@@ -134,8 +135,12 @@ func NewHub(store storage.Store, geoProvider geo.Provider, opts Options) *Hub {
 	if strings.TrimSpace(opts.CoversDir) == "" {
 		opts.CoversDir = filepath.Join(filepath.Dir(opts.NotesDir), "covers")
 	}
+	if strings.TrimSpace(opts.SiteDir) == "" {
+		opts.SiteDir = filepath.Join(filepath.Dir(opts.NotesDir), "site")
+	}
 	_ = os.MkdirAll(opts.NotesDir, 0o755)
 	_ = os.MkdirAll(opts.CoversDir, 0o755)
+	_ = os.MkdirAll(opts.SiteDir, 0o755)
 	h := &Hub{
 		store:       store,
 		opts:        opts,
@@ -224,6 +229,7 @@ func (h *Hub) RegisterRoutes(app *fiber.App) {
 
 	app.Get("/files/:token", h.handleDownload)
 	app.Get("/covers/:id", h.handleCover)
+	app.Get("/site/background", h.handleSiteBackground)
 
 	app.Use("/ws", func(c fiber.Ctx) error {
 		if !websocket.IsWebSocketUpgrade(c) {
@@ -465,6 +471,14 @@ func (cs *clientSession) handle(env protocol.Envelope) {
 		cs.handleAdminSetPublicDownload(ctx, env)
 	case protocol.TypeAdminNoteDownload:
 		cs.handleAdminNoteDownload(ctx, env)
+	case protocol.TypeSiteSettingsGet:
+		cs.handleSiteSettingsGet(ctx, env)
+	case protocol.TypeAdminSiteGet:
+		cs.handleAdminSiteGet(ctx, env)
+	case protocol.TypeAdminSiteUpdate:
+		cs.handleAdminSiteUpdate(ctx, env)
+	case protocol.TypeAdminSiteBgUpload:
+		cs.handleAdminSiteBgUpload(ctx, env)
 	case protocol.TypeEventsSubscribe:
 		cs.handleEventsSubscribe(env)
 	case protocol.TypeEventsUnsubscribe:
@@ -1748,6 +1762,265 @@ u.PasswordHash = ""
 		cs.replyOK(protocol.TypeAdminStats, env.ID, stats)
 	}
 
+func (h *Hub) publicSiteSettings(st *storage.SiteSettings) map[string]any {
+	if st == nil {
+		return map[string]any{}
+	}
+	out := map[string]any{
+		"heroTitle":      st.HeroTitle,
+		"heroSubtitle":   st.HeroSubtitle,
+		"backgroundMode": st.BackgroundMode,
+		"backgroundUrl":  st.BackgroundURL,
+		"focusX":         st.FocusX,
+		"focusY":         st.FocusY,
+		"overlayColor":   st.OverlayColor,
+		"overlayOpacity": st.OverlayOpacity,
+		"updatedAt":      st.UpdatedAt,
+	}
+	if st.BackgroundMode == "upload" && strings.TrimSpace(st.BackgroundPath) != "" {
+		// cache-bust when settings change so browsers pick up the new image
+		out["backgroundAssetUrl"] = "/site/background?v=" + url.QueryEscape(st.UpdatedAt)
+	}
+	return out
+}
+
+func (cs *clientSession) handleSiteSettingsGet(ctx context.Context, env protocol.Envelope) {
+	st, err := cs.hub.store.GetSiteSettings(ctx)
+	if err != nil {
+		cs.replyErr(env.ID, "db_error", "site settings failed")
+		return
+	}
+	cs.replyOK(protocol.TypeSiteSettingsGet, env.ID, map[string]any{
+		"settings": cs.hub.publicSiteSettings(st),
+	})
+}
+
+func (cs *clientSession) handleAdminSiteGet(ctx context.Context, env protocol.Envelope) {
+	if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+		cs.replyErr(env.ID, "forbidden", "admin required")
+		return
+	}
+	st, err := cs.hub.store.GetSiteSettings(ctx)
+	if err != nil {
+		cs.replyErr(env.ID, "db_error", "site settings failed")
+		return
+	}
+	cs.replyOK(protocol.TypeAdminSiteGet, env.ID, map[string]any{
+		"settings": cs.hub.publicSiteSettings(st),
+	})
+}
+
+func clampFloat(v, min, max float64) float64 {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func sanitizeOverlayColor(c string) string {
+	c = strings.TrimSpace(c)
+	if c == "" {
+		return "#0b0d12"
+	}
+	if len(c) == 7 && c[0] == '#' {
+		for i := 1; i < 7; i++ {
+			ch := c[i]
+			if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
+				return "#0b0d12"
+			}
+		}
+		return strings.ToLower(c)
+	}
+	return "#0b0d12"
+}
+
+func (cs *clientSession) handleAdminSiteUpdate(ctx context.Context, env protocol.Envelope) {
+	if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+		cs.replyErr(env.ID, "forbidden", "admin required")
+		return
+	}
+	payload, err := protocol.DecodePayload[struct {
+		HeroTitle      *string  `json:"heroTitle"`
+		HeroSubtitle   *string  `json:"heroSubtitle"`
+		BackgroundMode *string  `json:"backgroundMode"`
+		BackgroundURL  *string  `json:"backgroundUrl"`
+		FocusX         *float64 `json:"focusX"`
+		FocusY         *float64 `json:"focusY"`
+		OverlayColor   *string  `json:"overlayColor"`
+		OverlayOpacity *float64 `json:"overlayOpacity"`
+		ClearUpload    bool     `json:"clearUpload"`
+	}](env)
+	if err != nil {
+		cs.replyErr(env.ID, "bad_request", "invalid payload")
+		return
+	}
+	cur, err := cs.hub.store.GetSiteSettings(ctx)
+	if err != nil {
+		cs.replyErr(env.ID, "db_error", "site settings failed")
+		return
+	}
+	if payload.HeroTitle != nil {
+		title := strings.TrimSpace(*payload.HeroTitle)
+		if title == "" {
+			title = "TimeNotes Blog"
+		}
+		if len(title) > 120 {
+			cs.replyErr(env.ID, "bad_request", "hero title too long")
+			return
+		}
+		cur.HeroTitle = title
+	}
+	if payload.HeroSubtitle != nil {
+		sub := strings.TrimSpace(*payload.HeroSubtitle)
+		if len(sub) > 300 {
+			cs.replyErr(env.ID, "bad_request", "hero subtitle too long")
+			return
+		}
+		cur.HeroSubtitle = sub
+	}
+	if payload.BackgroundMode != nil {
+		mode := strings.ToLower(strings.TrimSpace(*payload.BackgroundMode))
+		switch mode {
+		case "none", "url", "upload":
+			cur.BackgroundMode = mode
+		default:
+			cs.replyErr(env.ID, "bad_request", "invalid background mode")
+			return
+		}
+	}
+	if payload.BackgroundURL != nil {
+		raw := strings.TrimSpace(*payload.BackgroundURL)
+		if raw != "" {
+			u, err := url.Parse(raw)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				cs.replyErr(env.ID, "bad_request", "background url must be http(s)")
+				return
+			}
+			if len(raw) > 2048 {
+				cs.replyErr(env.ID, "bad_request", "background url too long")
+				return
+			}
+		}
+		cur.BackgroundURL = raw
+	}
+	if payload.FocusX != nil {
+		cur.FocusX = clampFloat(*payload.FocusX, 0, 100)
+	}
+	if payload.FocusY != nil {
+		cur.FocusY = clampFloat(*payload.FocusY, 0, 100)
+	}
+	if payload.OverlayColor != nil {
+		cur.OverlayColor = sanitizeOverlayColor(*payload.OverlayColor)
+	}
+	if payload.OverlayOpacity != nil {
+		cur.OverlayOpacity = clampFloat(*payload.OverlayOpacity, 0, 0.9)
+	}
+	if payload.ClearUpload {
+		if cur.BackgroundPath != "" {
+			_ = os.Remove(cur.BackgroundPath)
+		}
+		cur.BackgroundPath = ""
+		if cur.BackgroundMode == "upload" {
+			cur.BackgroundMode = "none"
+		}
+	}
+	// If mode is upload but no file exists, fall back to none.
+	if cur.BackgroundMode == "upload" && strings.TrimSpace(cur.BackgroundPath) == "" {
+		cur.BackgroundMode = "none"
+	}
+	// If mode is url but url empty, fall back to none.
+	if cur.BackgroundMode == "url" && strings.TrimSpace(cur.BackgroundURL) == "" {
+		cur.BackgroundMode = "none"
+	}
+	cur.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	if err := cs.hub.store.UpdateSiteSettings(ctx, *cur); err != nil {
+		cs.replyErr(env.ID, "db_error", "update site settings failed")
+		return
+	}
+	pub := cs.hub.publicSiteSettings(cur)
+	cs.hub.events.broadcast(protocol.TypeEventSiteSettingsChanged, map[string]any{"settings": pub}, audienceAll)
+	cs.replyOK(protocol.TypeAdminSiteUpdate, env.ID, map[string]any{"settings": pub})
+}
+
+func (cs *clientSession) handleAdminSiteBgUpload(ctx context.Context, env protocol.Envelope) {
+	if _, err := cs.requireCurrentAdmin(ctx); err != nil {
+		cs.replyErr(env.ID, "forbidden", "admin required")
+		return
+	}
+	payload, err := protocol.DecodePayload[struct {
+		Data string `json:"data"`
+		Name string `json:"name"`
+	}](env)
+	if err != nil || strings.TrimSpace(payload.Data) == "" {
+		cs.replyErr(env.ID, "bad_request", "invalid payload")
+		return
+	}
+	// Allow optional data-url prefix.
+	raw := payload.Data
+	if i := strings.Index(raw, ","); i >= 0 && strings.Contains(strings.ToLower(raw[:i]), "base64") {
+		raw = raw[i+1:]
+	}
+	data, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		cs.replyErr(env.ID, "bad_request", "invalid base64")
+		return
+	}
+	const maxHeroBytes = 5 * 1024 * 1024
+	if len(data) == 0 || int64(len(data)) > maxHeroBytes {
+		cs.replyErr(env.ID, "bad_request", "image must be 1B–5MB")
+		return
+	}
+	// Reject HTML/SVG disguises early.
+	lower := strings.ToLower(string(data[:min(len(data), 256)]))
+	if strings.Contains(lower, "<svg") || strings.Contains(lower, "<html") || strings.Contains(lower, "<!doctype") {
+		cs.replyErr(env.ID, "bad_request", "svg/html not allowed")
+		return
+	}
+	ext, mime, err := validateThumbnailImage(data, 8192*8192)
+	if err != nil {
+		cs.replyErr(env.ID, "bad_request", "invalid image: must be png/jpg/webp/gif")
+		return
+	}
+	_ = mime
+	cur, err := cs.hub.store.GetSiteSettings(ctx)
+	if err != nil {
+		cs.replyErr(env.ID, "db_error", "site settings failed")
+		return
+	}
+	oldPath := cur.BackgroundPath
+	dest := filepath.Join(cs.hub.opts.SiteDir, "hero"+ext)
+	tmp := dest + ".part"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		cs.replyErr(env.ID, "io_error", "write failed")
+		return
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		_ = os.Remove(tmp)
+		cs.replyErr(env.ID, "io_error", "commit failed")
+		return
+	}
+	// Remove previous file if extension changed.
+	if oldPath != "" && oldPath != dest {
+		_ = os.Remove(oldPath)
+	}
+	cur.BackgroundPath = dest
+	cur.BackgroundMode = "upload"
+	cur.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	if err := cs.hub.store.UpdateSiteSettings(ctx, *cur); err != nil {
+		cs.replyErr(env.ID, "db_error", "update site settings failed")
+		return
+	}
+	pub := cs.hub.publicSiteSettings(cur)
+	cs.hub.events.broadcast(protocol.TypeEventSiteSettingsChanged, map[string]any{"settings": pub}, audienceAll)
+	cs.replyOK(protocol.TypeAdminSiteBgUpload, env.ID, map[string]any{
+		"settings": pub,
+		"name":     payload.Name,
+	})
+}
+
 	func (cs *clientSession) handleEventsSubscribe(env protocol.Envelope) {
 		cs.eventsOn = true
 		cs.replyOK(protocol.TypeEventsSubscribe, env.ID, map[string]any{"ok": true})
@@ -1832,6 +2105,31 @@ u.PasswordHash = ""
 		return c.SendFile(note.CoverPath)
 	}
 
+func (h *Hub) handleSiteBackground(c fiber.Ctx) error {
+	st, err := h.store.GetSiteSettings(c.Context())
+	if err != nil || st == nil || st.BackgroundMode != "upload" || strings.TrimSpace(st.BackgroundPath) == "" {
+		return fiber.ErrNotFound
+	}
+	// Ensure path is under SiteDir.
+	absSite, _ := filepath.Abs(h.opts.SiteDir)
+	absPath, err := filepath.Abs(st.BackgroundPath)
+	if err != nil || !strings.HasPrefix(absPath, absSite+string(os.PathSeparator)) {
+		return fiber.ErrNotFound
+	}
+	switch strings.ToLower(filepath.Ext(st.BackgroundPath)) {
+	case ".jpg", ".jpeg":
+		c.Set("Content-Type", "image/jpeg")
+	case ".webp":
+		c.Set("Content-Type", "image/webp")
+	case ".gif":
+		c.Set("Content-Type", "image/gif")
+	default:
+		c.Set("Content-Type", "image/png")
+	}
+	c.Set("Cache-Control", "public, max-age=3600")
+	return c.SendFile(st.BackgroundPath)
+}
+
 // MountStatic serves SPA for public and admin paths.
 // Important: do NOT redirect between /admin/{token} and /admin/{token}/.
 // Fiber's trailing-slash normalization would otherwise create ERR_TOO_MANY_REDIRECTS.
@@ -1875,7 +2173,7 @@ func MountStatic(app *fiber.App, webDir, adminToken string) {
 
 	app.Get("/*", func(c fiber.Ctx) error {
 		path := c.Path()
-		if strings.HasPrefix(path, "/ws") || strings.HasPrefix(path, "/files/") || path == "/healthz" {
+		if strings.HasPrefix(path, "/ws") || strings.HasPrefix(path, "/files/") || strings.HasPrefix(path, "/covers/") || strings.HasPrefix(path, "/site/") || path == "/healthz" {
 			return fiber.ErrNotFound
 		}
 		if strings.HasPrefix(path, "/admin/") {

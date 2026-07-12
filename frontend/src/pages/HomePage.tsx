@@ -1,8 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Spin, Typography } from '@douyinfe/semi-ui';
+import { Empty, Spin, Typography } from '@douyinfe/semi-ui';
 import { IconBook, IconComment, IconDownload, IconLikeThumb } from '@douyinfe/semi-icons';
 import { blogWS } from '../lib/wsClient';
+import { PublicNav } from '../components/PublicNav';
+import { defaultSiteSettings, resolveHeroBackground, type SiteSettings } from '../types/site';
 
 type Note = {
   id: string;
@@ -17,17 +19,26 @@ type Note = {
 };
 
 function coverSrc(note: Note) {
-  if (!note.coverUrl) {
-    return '';
-  }
+  if (!note.coverUrl) return '';
   return note.coverUrl.startsWith('http') ? note.coverUrl : `${location.origin}${note.coverUrl}`;
+}
+
+function hexToRgba(hex: string, alpha: number): string {
+  const h = hex.replace('#', '');
+  if (h.length !== 6) return `rgba(11,13,18,${alpha})`;
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
 }
 
 export function HomePage() {
   const [notes, setNotes] = useState<Note[]>([]);
+  const [settings, setSettings] = useState<SiteSettings>(defaultSiteSettings);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [brokenCovers, setBrokenCovers] = useState<Record<string, boolean>>({});
+  const [scrolledPastHero, setScrolledPastHero] = useState(false);
   const navigate = useNavigate();
 
   const loadNotes = async () => {
@@ -36,28 +47,41 @@ export function HomePage() {
     setNotes(res.notes || []);
   };
 
+  const loadSettings = async () => {
+    await blogWS.connect();
+    const res = await blogWS.request<{ settings: SiteSettings }>('site.settings.get', {});
+    if (res.settings) {
+      setSettings({ ...defaultSiteSettings(), ...res.settings });
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        await loadNotes();
+        await Promise.all([loadNotes(), loadSettings()]);
         void blogWS.request('visit.track', {
           path: '/',
           userAgent: navigator.userAgent,
         }).catch(() => undefined);
       } catch (e) {
-        if (!cancelled) {
-          setError(String(e));
-        }
+        if (!cancelled) setError(String(e));
       } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
+        if (!cancelled) setLoading(false);
       }
     })();
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    const onScroll = () => {
+      setScrolledPastHero(window.scrollY > window.innerHeight * 0.55);
+    };
+    onScroll();
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
   }, []);
 
   useEffect(() => {
@@ -70,9 +94,7 @@ export function HomePage() {
             return prev.filter((n) => n.id !== p.note!.id);
           }
           const idx = prev.findIndex((n) => n.id === p.note!.id);
-          if (idx < 0) {
-            return [p.note!, ...prev];
-          }
+          if (idx < 0) return [p.note!, ...prev];
           const next = prev.slice();
           next[idx] = { ...next[idx], ...p.note! };
           return next;
@@ -105,9 +127,15 @@ export function HomePage() {
             : n
         )));
       }),
+      blogWS.on('event.site-settings.changed', (payload) => {
+        const p = payload as { settings?: SiteSettings };
+        if (p.settings) {
+          setSettings({ ...defaultSiteSettings(), ...p.settings });
+        }
+      }),
       blogWS.onSnapshot(async () => {
         try {
-          await loadNotes();
+          await Promise.all([loadNotes(), loadSettings()]);
         } catch {
           // ignore
         }
@@ -118,86 +146,116 @@ export function HomePage() {
     };
   }, []);
 
-  return (
-    <div className="page-shell">
-      <header className="glass" style={{ borderRadius: 22, padding: '28px 26px', marginBottom: 24 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <IconBook size="extra-large" style={{ color: '#7dd3fc' }} />
-          <div>
-            <h1 className="hero-title">TimeNotes Blog</h1>
-            <p className="muted" style={{ margin: '6px 0 0' }}>
-              浏览公开手账本 · 点赞 · 评论
-            </p>
-          </div>
-        </div>
-      </header>
+  const heroBg = useMemo(() => resolveHeroBackground(settings), [settings]);
+  const overlay = hexToRgba(settings.overlayColor || '#0b0d12', Number(settings.overlayOpacity ?? 0.45));
 
-      {loading ? (
-        <div style={{ display: 'grid', placeItems: 'center', minHeight: 240 }}>
-          <Spin size="large" />
+  return (
+    <div className="home-page">
+      <div className={`home-sticky-nav ${scrolledPastHero ? 'is-visible' : ''}`}>
+        <PublicNav compact />
+      </div>
+
+      <section
+        className="home-hero"
+        style={{
+          backgroundImage: heroBg
+            ? `linear-gradient(${overlay}, ${overlay}), url(${heroBg})`
+            : undefined,
+          backgroundPosition: `${settings.focusX}% ${settings.focusY}%`,
+        }}
+      >
+        <div className="home-hero-inner">
+          <div className="home-hero-top">
+            <PublicNav />
+          </div>
+          <div className="home-hero-content">
+            <div className="home-hero-badge">
+              <IconBook /> 公开手账馆
+            </div>
+            <h1 className="home-hero-title">{settings.heroTitle || 'TimeNotes Blog'}</h1>
+            <p className="home-hero-subtitle">{settings.heroSubtitle}</p>
+            <button
+              type="button"
+              className="home-hero-cta"
+              onClick={() => document.getElementById('notes-grid')?.scrollIntoView({ behavior: 'smooth' })}
+            >
+              向下浏览
+            </button>
+          </div>
+          <div className="home-hero-scroll-hint" aria-hidden>↓</div>
         </div>
-      ) : error ? (
-        <div className="glass" style={{ borderRadius: 16, padding: 20 }}>
-          <Typography.Text type="danger">加载失败：{error}</Typography.Text>
+      </section>
+
+      <section id="notes-grid" className="home-grid-section">
+        <div className="home-grid-header">
+          <Typography.Title heading={3} style={{ margin: 0 }}>手账本</Typography.Title>
+          <Typography.Text type="tertiary">{notes.length} 本公开</Typography.Text>
         </div>
-      ) : notes.length === 0 ? (
-        <div className="glass" style={{ borderRadius: 16, padding: 28, textAlign: 'center' }}>
-          <p className="muted">还没有公开的手账本</p>
-        </div>
-      ) : (
-        <div className="note-grid">
-          {notes.map((note) => {
-            const src = coverSrc(note);
-            const broken = !src || brokenCovers[note.id];
-            return (
-              <button
-                key={note.id}
-                type="button"
-                className="note-card glass"
-                style={{ border: 'none', color: 'inherit', textAlign: 'left', padding: 0 }}
-                onClick={() => navigate(`/note/${note.id}`)}
-              >
-                <div className="note-cover" style={{ padding: 0, display: 'block' }}>
-                  {broken ? (
-                    <div className="note-cover-broken">
-                      <div>
-                        <strong>封面缺失/损坏</strong>
-                        <div style={{ fontSize: 13 }}>{note.title || '未命名手账'}</div>
-                        <div style={{ fontSize: 12, marginTop: 8 }}>请通过 TimeNotes 客户端重新生成封面后上传</div>
+
+        {loading ? (
+          <div className="home-grid-state">
+            <Spin size="large" />
+          </div>
+        ) : error ? (
+          <div className="home-grid-state glass-panel">
+            <Typography.Text type="danger">加载失败：{error}</Typography.Text>
+          </div>
+        ) : notes.length === 0 ? (
+          <div className="home-grid-state glass-panel">
+            <Empty description="还没有公开的手账本" />
+          </div>
+        ) : (
+          <div className="note-grid note-grid--manager">
+            {notes.map((note) => {
+              const src = coverSrc(note);
+              const broken = !src || brokenCovers[note.id];
+              return (
+                <button
+                  key={note.id}
+                  type="button"
+                  className="note-card glass-panel"
+                  onClick={() => navigate(`/note/${note.id}`)}
+                >
+                  <div className="note-cover">
+                    {broken ? (
+                      <div className="note-cover-broken">
+                        <div>
+                          <strong>封面缺失/损坏</strong>
+                          <div style={{ fontSize: 13 }}>{note.title || '未命名手账'}</div>
+                          <div style={{ fontSize: 12, marginTop: 8 }}>请通过 TimeNotes 客户端重新生成封面后上传</div>
+                        </div>
                       </div>
-                    </div>
-                  ) : (
-                    <img
-                      className="note-cover-image"
-                      src={src}
-                      alt={note.title || 'cover'}
-                      onError={() => setBrokenCovers((prev) => ({ ...prev, [note.id]: true }))}
-                    />
-                  )}
-                </div>
-                <div style={{ padding: '12px 14px' }}>
-                  <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>{note.title || '未命名手账'}</div>
-                  <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>@{note.ownerName || 'unknown'}</div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
-                    <span className="muted" style={{ fontSize: 12 }}>
-                      {new Date(note.updatedAt).toLocaleDateString()}
-                    </span>
-                    <span style={{ display: 'flex', gap: 10, fontSize: 12, alignItems: 'center' }} className="muted">
-                      {note.publicDownload ? (
-                        <span className="public-download-tag" title="允许公开下载">
-                          <IconDownload size="small" /> 可下载
-                        </span>
-                      ) : null}
-                      <span><IconLikeThumb size="small" /> {note.likeCount}</span>
-                      <span><IconComment size="small" /> {note.commentCount}</span>
-                    </span>
+                    ) : (
+                      <img
+                        className="note-cover-image"
+                        src={src}
+                        alt={note.title || 'cover'}
+                        onError={() => setBrokenCovers((prev) => ({ ...prev, [note.id]: true }))}
+                      />
+                    )}
                   </div>
-                </div>
-              </button>
-            );
-          })}
-        </div>
-      )}
+                  <div className="note-card-body">
+                    <div className="note-card-title">{note.title || '未命名手账'}</div>
+                    <div className="note-card-meta">@{note.ownerName || 'unknown'}</div>
+                    <div className="note-card-footer">
+                      <span>{new Date(note.updatedAt).toLocaleDateString()}</span>
+                      <span className="note-card-stats">
+                        {note.publicDownload ? (
+                          <span className="public-download-tag" title="允许公开下载">
+                            <IconDownload size="small" /> 可下载
+                          </span>
+                        ) : null}
+                        <span><IconLikeThumb size="small" /> {note.likeCount}</span>
+                        <span><IconComment size="small" /> {note.commentCount}</span>
+                      </span>
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </section>
     </div>
   );
 }

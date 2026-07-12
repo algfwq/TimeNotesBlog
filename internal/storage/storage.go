@@ -84,6 +84,7 @@ type VisitStats struct {
 	RecentCount  int64            `json:"recentCount"`
 	Daily        []DailyCount     `json:"daily"`
 	Locations    []VisitLocation  `json:"locations"`
+	Countries    []CountryCount   `json:"countries"`
 	NoteStats    []NoteEngagement `json:"noteStats"`
 }
 
@@ -99,6 +100,27 @@ type VisitLocation struct {
 	Lat     float64 `json:"lat"`
 	Lng     float64 `json:"lng"`
 	Count   int64   `json:"count"`
+}
+
+// CountryCount aggregates visits by country for choropleth maps.
+// Private/loopback/unresolved IPs never contribute (empty country).
+type CountryCount struct {
+	Country string `json:"country"`
+	Count   int64  `json:"count"`
+}
+
+type SiteSettings struct {
+	HeroTitle       string  `json:"heroTitle"`
+	HeroSubtitle    string  `json:"heroSubtitle"`
+	BackgroundMode  string  `json:"backgroundMode"` // none | url | upload
+	BackgroundPath  string  `json:"-"`
+	BackgroundURL   string  `json:"backgroundUrl"`
+	BackgroundAsset string  `json:"backgroundAssetUrl,omitempty"` // served path when mode=upload
+	FocusX          float64 `json:"focusX"`
+	FocusY          float64 `json:"focusY"`
+	OverlayColor    string  `json:"overlayColor"`
+	OverlayOpacity  float64 `json:"overlayOpacity"`
+	UpdatedAt       string  `json:"updatedAt"`
 }
 
 type NoteEngagement struct {
@@ -155,4 +177,7 @@ type Store interface {
 	AddVisit(ctx context.Context, v Visit) error
 	BackfillVisitGeo(ctx context.Context, ipHash string, info GeoInfo) error
 	GetVisitStats(ctx context.Context, recentDays int) (*VisitStats, error)
+
+	GetSiteSettings(ctx context.Context) (*SiteSettings, error)
+	UpdateSiteSettings(ctx context.Context, s SiteSettings) error
 }

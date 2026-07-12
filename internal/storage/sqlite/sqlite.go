@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -664,7 +665,7 @@ func (s *Store) GetVisitStats(ctx context.Context, recentDays int) (*storage.Vis
 	rows.Close()
 
 	locRows, err := s.db.QueryContext(ctx, `SELECT country, region, city, COALESCE(lat,0), COALESCE(lng,0), COUNT(1)
-		FROM visits WHERE lat IS NOT NULL AND lng IS NOT NULL AND substr(created_at,1,10) >= ?
+		FROM visits WHERE lat IS NOT NULL AND lng IS NOT NULL AND country != '' AND substr(created_at,1,10) >= ?
 		GROUP BY country, region, city, lat, lng ORDER BY COUNT(1) DESC LIMIT 500`, since)
 	if err != nil {
 		return nil, err
@@ -678,6 +679,22 @@ func (s *Store) GetVisitStats(ctx context.Context, recentDays int) (*storage.Vis
 		stats.Locations = append(stats.Locations, loc)
 	}
 	locRows.Close()
+
+	countryRows, err := s.db.QueryContext(ctx, `SELECT country, COUNT(1) FROM visits
+		WHERE country != '' AND country IS NOT NULL AND substr(created_at,1,10) >= ?
+		GROUP BY country ORDER BY COUNT(1) DESC`, since)
+	if err != nil {
+		return nil, err
+	}
+	for countryRows.Next() {
+		var c storage.CountryCount
+		if err := countryRows.Scan(&c.Country, &c.Count); err != nil {
+			countryRows.Close()
+			return nil, err
+		}
+		stats.Countries = append(stats.Countries, c)
+	}
+	countryRows.Close()
 
 	noteRows, err := s.db.QueryContext(ctx, `SELECT id, title, like_count, comment_count, visible FROM notes ORDER BY like_count DESC, comment_count DESC`)
 	if err != nil {
@@ -699,4 +716,55 @@ func (s *Store) GetVisitStats(ctx context.Context, recentDays int) (*storage.Vis
 type Daily struct {
 	Date  string
 	Count int64
+}
+
+func (s *Store) GetSiteSettings(ctx context.Context) (*storage.SiteSettings, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT hero_title, hero_subtitle, background_mode, background_path, background_url,
+		focus_x, focus_y, overlay_color, overlay_opacity, updated_at FROM site_settings WHERE id = 1`)
+	var st storage.SiteSettings
+	if err := row.Scan(
+		&st.HeroTitle, &st.HeroSubtitle, &st.BackgroundMode, &st.BackgroundPath, &st.BackgroundURL,
+		&st.FocusX, &st.FocusY, &st.OverlayColor, &st.OverlayOpacity, &st.UpdatedAt,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return &storage.SiteSettings{
+				HeroTitle:      "TimeNotes Blog",
+				HeroSubtitle:   "浏览公开手账本 · 点赞 · 评论",
+				BackgroundMode: "none",
+				FocusX:         50,
+				FocusY:         40,
+				OverlayColor:   "#0b0d12",
+				OverlayOpacity: 0.45,
+				UpdatedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+			}, nil
+		}
+		return nil, err
+	}
+	return &st, nil
+}
+
+func (s *Store) UpdateSiteSettings(ctx context.Context, st storage.SiteSettings) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if st.UpdatedAt == "" {
+		st.UpdatedAt = now
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO site_settings(
+		id, hero_title, hero_subtitle, background_mode, background_path, background_url,
+		focus_x, focus_y, overlay_color, overlay_opacity, updated_at
+	) VALUES (1,?,?,?,?,?,?,?,?,?,?)
+	ON CONFLICT(id) DO UPDATE SET
+		hero_title=excluded.hero_title,
+		hero_subtitle=excluded.hero_subtitle,
+		background_mode=excluded.background_mode,
+		background_path=excluded.background_path,
+		background_url=excluded.background_url,
+		focus_x=excluded.focus_x,
+		focus_y=excluded.focus_y,
+		overlay_color=excluded.overlay_color,
+		overlay_opacity=excluded.overlay_opacity,
+		updated_at=excluded.updated_at`,
+		st.HeroTitle, st.HeroSubtitle, st.BackgroundMode, st.BackgroundPath, st.BackgroundURL,
+		st.FocusX, st.FocusY, st.OverlayColor, st.OverlayOpacity, st.UpdatedAt,
+	)
+	return err
 }

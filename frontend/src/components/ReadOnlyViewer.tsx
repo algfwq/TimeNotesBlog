@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from 'react';
+import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import { Button, Slider, Typography } from '@douyinfe/semi-ui';
-import { IconChevronLeft, IconChevronRight, IconRefresh } from '@douyinfe/semi-icons';
+import {
+  IconArrowLeft,
+  IconChevronLeft,
+  IconChevronRight,
+  IconComment,
+  IconDownload,
+  IconLikeThumb,
+  IconRefresh,
+} from '@douyinfe/semi-icons';
 import type { AssetMeta, NoteDocument, NoteElement, NotePage } from '../types';
 import { findClosestLinkHref, openExternalLink } from '../lib/externalLinks';
 import { assetDataUrl, mergeAssetWithCache } from '../lib/files';
@@ -32,10 +40,32 @@ interface FlipState {
   sheetBack: NotePage | null;
 }
 
-export function ReadOnlyViewer({ document }: { document: NoteDocument }) {
-  const wrapRef = useRef<HTMLDivElement | null>(null);
+/** Blog chrome overlayed on the client-style reading stage. */
+export type ReaderChrome = {
+  title: string;
+  ownerName?: string;
+  liked?: boolean;
+  likeCount?: number;
+  commentCount?: number;
+  canDownload?: boolean;
+  onBack?: () => void;
+  onLike?: () => void;
+  onComment?: () => void;
+  onDownload?: () => void;
+};
+
+export function ReadOnlyViewer({
+  document,
+  chrome,
+}: {
+  document: NoteDocument;
+  chrome?: ReaderChrome;
+}) {
+  const stageRef = useRef<HTMLDivElement | null>(null);
   const panStartRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
   const sidesheetOpenRef = useRef(false);
+  const userScaledRef = useRef(false);
+  const scaleRef = useRef(0.8);
 
   const [scale, setScale] = useState(0.8);
   const [fitScale, setFitScale] = useState(0.8);
@@ -74,22 +104,47 @@ export function ReadOnlyViewer({ document }: { document: NoteDocument }) {
 
   const currentSpread = getSpreadPages(spreadIndex);
 
+  const applyUserScale = useCallback((next: number) => {
+    const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, next));
+    userScaledRef.current = true;
+    const rounded = Number(clamped.toFixed(3));
+    scaleRef.current = rounded;
+    setScale(rounded);
+  }, []);
+
+  // Keep ref in sync for non-React wheel handler and fit-scale auto updates.
+  useEffect(() => {
+    scaleRef.current = scale;
+  }, [scale]);
+
+  // Fit-to-stage: observe the stage viewport (not the whole page / toolbar).
   useLayoutEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+
     const updateFit = () => {
-      const rect = wrapRef.current?.getBoundingClientRect();
-      if (!rect) return;
-      const pw = samplePage.width;
-      const ph = samplePage.height;
-      const combinedW = pw * 2 + SPINE_WIDTH + 80;
-      const next = Math.min((rect.width - 60) / combinedW, (rect.height - 130) / ph, 1.0);
-      const normalized = Math.max(0.28, Number(next.toFixed(2)));
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 48 || rect.height < 48) return;
+      const pw = samplePage.width || 800;
+      const ph = samplePage.height || 1100;
+      const combinedW = pw * 2 + SPINE_WIDTH + 48;
+      const next = Math.min((rect.width - 32) / combinedW, (rect.height - 32) / ph, 1.15);
+      const normalized = Math.max(0.22, Number(next.toFixed(3)));
       setFitScale(normalized);
-      setScale((current) => (current === fitScale ? normalized : current));
+      if (!userScaledRef.current) {
+        setScale(normalized);
+      }
     };
+
     updateFit();
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(updateFit) : null;
+    ro?.observe(el);
     window.addEventListener('resize', updateFit);
-    return () => window.removeEventListener('resize', updateFit);
-  }, [samplePage.height, samplePage.width, fitScale]);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener('resize', updateFit);
+    };
+  }, [samplePage.height, samplePage.width, document]);
 
   useEffect(() => {
     const refresh = () => {
@@ -120,6 +175,7 @@ export function ReadOnlyViewer({ document }: { document: NoteDocument }) {
     setSpreadIndex(0);
     setPan({ x: 0, y: 0 });
     setFlip(null);
+    userScaledRef.current = false;
   }, [document]);
 
   const commitFlip = useCallback(
@@ -201,11 +257,30 @@ export function ReadOnlyViewer({ document }: { document: NoteDocument }) {
     panStartRef.current = null;
   };
 
-  const handleWheel = (e: ReactWheelEvent) => {
-    if (sidesheetOpenRef.current) return;
-    e.preventDefault();
-    setScale((s) => Number(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, s + (e.deltaY > 0 ? -0.06 : 0.06))).toFixed(2)));
-  };
+  // Native non-passive wheel listener is required: React onWheel is often passive,
+  // so preventDefault cannot block browser page-zoom (esp. trackpad pinch / ctrl+wheel).
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+
+    const onWheel = (e: WheelEvent) => {
+      if (sidesheetOpenRef.current) return;
+      // Always claim the gesture inside the stage so only the notebook scales.
+      e.preventDefault();
+      e.stopPropagation();
+
+      // Trackpad pinch reports ctrlKey + pixel deltas; mouse wheel is larger line steps.
+      let delta = e.deltaY;
+      if (e.deltaMode === 1) delta *= 16; // lines → px approx
+      if (e.deltaMode === 2) delta *= 120; // pages → px approx
+      const step = Math.max(-0.12, Math.min(0.12, -delta * 0.0012));
+      if (step === 0) return;
+      applyUserScale(scaleRef.current + step);
+    };
+
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [applyUserScale]);
 
   const pageElementsMap = useMemo(() => {
     const map = new Map<string, NoteElement[]>();
@@ -247,65 +322,144 @@ export function ReadOnlyViewer({ document }: { document: NoteDocument }) {
   const atStart = spreadIndex === 0;
   const atEnd = spreadIndex >= totalSpreads - 1;
   const leftSlotWidth = displayedLeft?.width ?? samplePage.width;
+  const safeScale = Number.isFinite(scale) ? scale : fitScale || 1;
+  const pageLabel = firstIdx >= 0
+    ? `${firstIdx + 1}${lastIdx !== firstIdx ? `-${lastIdx + 1}` : ''}`
+    : '0';
+
+  const zoomControls: ReactNode = (
+    <div className="reader-zoom-controls">
+      <span className="reader-zoom-label">{Math.round(safeScale * 100)}%</span>
+      <Slider
+        className="reader-zoom-slider"
+        value={safeScale * 100}
+        min={Math.round(ZOOM_MIN * 100)}
+        max={Math.round(ZOOM_MAX * 100)}
+        step={5}
+        tipFormatter={(value) => `${Math.round(Number(value) || safeScale * 100)}%`}
+        onChange={(v) => {
+          const next = Array.isArray(v) ? Number(v[0]) : Number(v);
+          if (!Number.isFinite(next)) return;
+          applyUserScale(next / 100);
+        }}
+      />
+      <Button
+        size="small"
+        theme="borderless"
+        type="tertiary"
+        icon={<IconRefresh />}
+        title="适应窗口"
+        onClick={() => {
+          userScaledRef.current = false;
+          setScale(fitScale);
+          setPan({ x: 0, y: 0 });
+        }}
+      />
+    </div>
+  );
+
+  const pageNav: ReactNode = (
+    <div className="reader-page-nav">
+      <Button
+        size="small"
+        theme="borderless"
+        type="tertiary"
+        icon={<IconChevronLeft />}
+        disabled={atStart || Boolean(flip)}
+        onClick={() => goToSpread(spreadIndex - 1)}
+      />
+      <span className="reader-page-indicator tabular-nums">
+        {spreadIndex + 1}/{totalSpreads}
+        <span className="reader-page-indicator-sub"> · {pageLabel}/{document.pages.length}</span>
+      </span>
+      <Button
+        size="small"
+        theme="borderless"
+        type="tertiary"
+        icon={<IconChevronRight />}
+        disabled={atEnd || Boolean(flip)}
+        onClick={() => goToSpread(spreadIndex + 1)}
+      />
+    </div>
+  );
 
   return (
-    <div ref={wrapRef} className="reading-mode-stage flex h-full min-h-0 flex-col">
+    <div className="reading-mode-stage reader-blog-stage flex h-full min-h-0 flex-col">
       <FontFaceDefinitions fonts={document.fonts} />
-      <div className="book-toolbar flex min-h-12 shrink-0 flex-wrap items-center justify-between gap-3 px-4 py-2">
-        <div>
-          <Typography.Text strong style={{ color: '#2f2a24' }}>{document.title}</Typography.Text>
-          <span className="ml-3 text-xs" style={{ color: 'rgba(0,0,0,0.45)' }}>
-            {firstIdx >= 0 ? `${firstIdx + 1}${lastIdx !== firstIdx ? `-${lastIdx + 1}` : ''}` : '0'} / {document.pages.length}
-          </span>
+
+      {chrome ? (
+        <div className="reader-blog-toolbar">
+          <div className="reader-blog-toolbar-left">
+            <Button
+              theme="borderless"
+              type="tertiary"
+              icon={<IconArrowLeft />}
+              onClick={chrome.onBack}
+            >
+              返回
+            </Button>
+            <div className="reader-blog-title-block">
+              <Typography.Title heading={5} className="reader-blog-title" ellipsis={{ showTooltip: true }}>
+                {chrome.title || document.title || '手账'}
+              </Typography.Title>
+              <div className="reader-blog-owner">上传者 @{chrome.ownerName || 'unknown'}</div>
+            </div>
+          </div>
+          <div className="reader-blog-toolbar-center">
+            {pageNav}
+          </div>
+          <div className="reader-blog-toolbar-right">
+            {zoomControls}
+            <Button
+              theme={chrome.liked ? 'solid' : 'light'}
+              type="primary"
+              icon={<IconLikeThumb />}
+              onClick={chrome.onLike}
+            >
+              {chrome.likeCount ?? 0}
+            </Button>
+            <Button
+              theme="light"
+              type="tertiary"
+              icon={<IconComment />}
+              onClick={chrome.onComment}
+            >
+              评论 {chrome.commentCount ?? 0}
+            </Button>
+            {chrome.canDownload ? (
+              <Button theme="light" type="tertiary" icon={<IconDownload />} onClick={chrome.onDownload}>
+                下载
+              </Button>
+            ) : null}
+          </div>
         </div>
-        <div className="flex items-center gap-1">
-          <Button size="small" theme="borderless" icon={<IconChevronLeft />} disabled={atStart || Boolean(flip)} onClick={() => goToSpread(spreadIndex - 1)} />
-          <span className="mx-1 min-w-[4ch] text-center text-xs tabular-nums" style={{ color: 'rgba(0,0,0,0.55)' }}>
-            {spreadIndex + 1}/{totalSpreads}
-          </span>
-          <Button size="small" theme="borderless" icon={<IconChevronRight />} disabled={atEnd || Boolean(flip)} onClick={() => goToSpread(spreadIndex + 1)} />
+      ) : (
+        <div className="book-toolbar reader-blog-toolbar reader-blog-toolbar--plain flex min-h-12 shrink-0 flex-wrap items-center justify-between gap-3 px-4 py-2">
+          <div>
+            <Typography.Text strong>{document.title}</Typography.Text>
+            <span className="ml-3 text-xs opacity-60">
+              {pageLabel} / {document.pages.length}
+            </span>
+          </div>
+          {pageNav}
+          {zoomControls}
         </div>
-        <div className="flex w-64 items-center gap-3">
-          <span className="shrink-0 text-xs" style={{ color: 'rgba(0,0,0,0.55)' }}>{Math.round((Number.isFinite(scale) ? scale : 1) * 100)}%</span>
-          <Slider
-            value={(Number.isFinite(scale) ? scale : 1) * 100}
-            min={25}
-            max={240}
-            step={5}
-            tipFormatter={(value) => `${Math.round(Number(value) || (Number.isFinite(scale) ? scale : 1) * 100)}%`}
-            onChange={(v) => {
-              const next = Array.isArray(v) ? Number(v[0]) : Number(v);
-              if (!Number.isFinite(next)) {
-                return;
-              }
-              setScale(Math.min(2.4, Math.max(0.25, next / 100)));
-            }}
-          />
-          <Button
-            size="small"
-            theme="borderless"
-            icon={<IconRefresh />}
-            onClick={() => {
-              setScale(fitScale);
-              setPan({ x: 0, y: 0 });
-            }}
-          />
-        </div>
-      </div>
+      )}
 
       <div
-        className="relative min-h-0 flex-1 overflow-hidden"
-        style={{ cursor: 'grab', minHeight: 520 }}
+        ref={stageRef}
+        className="reader-stage relative min-h-0 flex-1 overflow-hidden"
+        style={{ cursor: 'grab' }}
         onPointerDown={startPan}
         onPointerMove={movePan}
         onPointerUp={endPan}
         onPointerLeave={endPan}
-        onWheel={handleWheel}
       >
         <div
-          className="absolute left-1/2 top-1/2"
+          className="reader-stage-world absolute left-1/2 top-1/2 will-change-transform"
           style={{
-            transform: `translate(-50%, -50%) translate(${pan.x}px, ${pan.y}px) scale(${scale})`,
+            transform: `translate3d(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px), 0) scale(${safeScale})`,
+            transformOrigin: 'center center',
           }}
         >
           <div className="book-flip-perspective relative flex">

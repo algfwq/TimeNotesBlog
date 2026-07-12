@@ -43,6 +43,11 @@ const (
 	TypeAdminSelfUpdate    = "admin.self.update"
 	TypeAdminNoteSetPublicDownload = "admin.notes.set_public_download"
 	TypeAdminNoteDownload  = "admin.notes.download"
+	TypeAdminSiteGet       = "admin.site.get"
+	TypeAdminSiteUpdate    = "admin.site.update"
+	TypeAdminSiteBgUpload  = "admin.site.background.upload"
+
+	TypeSiteSettingsGet = "site.settings.get"
 
 	TypeEventsSubscribe   = "events.subscribe"
 	TypeEventsUnsubscribe = "events.unsubscribe"

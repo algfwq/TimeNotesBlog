@@ -8,7 +8,6 @@ import { AdminApp } from './pages/admin/AdminApp';
 Toast.config({ duration: 2 });
 
 function adminBasename(): string | null {
-  // /admin/{token} or /admin/{token}/...
   const m = location.pathname.match(/^\/admin\/([^/]+)/);
   if (!m) {
     return null;

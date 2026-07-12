@@ -563,18 +563,18 @@
 /* ── Book / Diary Reading Mode ── */
 
 .reading-mode-stage {
-  background:
+  background: var(--tn-reader-stage,
     radial-gradient(120% 100% at 50% -10%, rgba(255, 250, 240, 0.32), transparent 55%),
     radial-gradient(140% 120% at 50% 120%, rgba(0, 0, 0, 0.28), transparent 60%),
-    linear-gradient(160deg, #cabd9c 0%, #bdaf8c 45%, #ab9d79 100%);
+    linear-gradient(160deg, #cabd9c 0%, #bdaf8c 45%, #ab9d79 100%));
 }
 
 .book-toolbar {
-  border-bottom: 1px solid rgba(0, 0, 0, 0.12);
-  background: linear-gradient(180deg, rgba(255, 252, 245, 0.92), rgba(247, 241, 228, 0.82));
+  border-bottom: 1px solid var(--tn-reader-toolbar-border, rgba(0, 0, 0, 0.12));
+  background: var(--tn-reader-toolbar, linear-gradient(180deg, rgba(255, 252, 245, 0.92), rgba(247, 241, 228, 0.82)));
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
-  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.6) inset, 0 6px 18px rgba(70, 56, 34, 0.12);
+  color: var(--tn-text, #2f2a24);
 }
 
 .book-flip-perspective {

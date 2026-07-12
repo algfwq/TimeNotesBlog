@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Button, SideSheet, Spin, TextArea, Toast, Typography } from '@douyinfe/semi-ui';
-import { IconArrowLeft, IconComment, IconDownload, IconLikeThumb } from '@douyinfe/semi-icons';
 import { blogWS } from '../lib/wsClient';
 import { loadTNoteFromUrl, releaseTNoteObjectUrls, type LoadedTNote } from '../lib/tnote';
 import { ReaderView } from '../components/ReaderView';
@@ -122,6 +121,27 @@ export function ReaderPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
+  // Block browser page-zoom (trackpad pinch / ctrl+wheel) while the reader is open.
+  // Notebook zoom is handled inside the stage with a non-passive listener.
+  useEffect(() => {
+    const blockBrowserZoom = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+      }
+    };
+    const blockGesture = (e: Event) => {
+      e.preventDefault();
+    };
+    document.addEventListener('wheel', blockBrowserZoom, { passive: false, capture: true });
+    document.addEventListener('gesturestart', blockGesture, { passive: false } as AddEventListenerOptions);
+    document.addEventListener('gesturechange', blockGesture, { passive: false } as AddEventListenerOptions);
+    return () => {
+      document.removeEventListener('wheel', blockBrowserZoom, true);
+      document.removeEventListener('gesturestart', blockGesture);
+      document.removeEventListener('gesturechange', blockGesture);
+    };
+  }, []);
+
   useEffect(() => {
     const unsubs = [
       blogWS.on('event.like.changed', (payload) => {
@@ -234,9 +254,20 @@ export function ReaderPage() {
     await submitComment(who);
   };
 
+  const onDownload = async () => {
+    try {
+      const res = await blogWS.request<NoteGetResponse & { exportUrl?: string }>('notes.get', { id });
+      const url = res.exportUrl || '';
+      if (!url) throw new Error('download unavailable');
+      window.location.href = url.startsWith('http') ? url : `${location.origin}${url}`;
+    } catch (e) {
+      Toast.error(String(e));
+    }
+  };
+
   if (loading) {
     return (
-      <div style={{ minHeight: '70vh', display: 'grid', placeItems: 'center' }}>
+      <div className="reader-page reader-page--state">
         <Spin size="large" />
       </div>
     );
@@ -244,8 +275,8 @@ export function ReaderPage() {
 
   if (unavailable) {
     return (
-      <div className="page-shell">
-        <div className="glass" style={{ borderRadius: 16, padding: 28, textAlign: 'center' }}>
+      <div className="reader-page reader-page--state">
+        <div className="glass-panel" style={{ borderRadius: 16, padding: 28, textAlign: 'center' }}>
           <Typography.Title heading={4} style={{ marginTop: 0 }}>{unavailable}</Typography.Title>
           <Button theme="solid" type="primary" onClick={() => navigate('/')}>返回首页</Button>
         </div>
@@ -254,49 +285,27 @@ export function ReaderPage() {
   }
 
   return (
-    <div className="page-shell">
-      <div className="glass" style={{ borderRadius: 18, padding: 16, marginBottom: 18, display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-          <Button icon={<IconArrowLeft />} theme="borderless" type="tertiary" onClick={() => navigate('/')}>
-            返回
-          </Button>
-          <div>
-            <Typography.Title heading={4} style={{ margin: 0, color: '#f4f1ea' }}>{title}</Typography.Title>
-            <div className="muted" style={{ fontSize: 13 }}>上传者 @{note?.ownerName || 'unknown'}</div>
-          </div>
+    <div className="reader-page">
+      {loaded?.document ? (
+        <ReaderView
+          document={loaded.document}
+          chrome={{
+            title,
+            ownerName: note?.ownerName,
+            liked,
+            likeCount: note?.likeCount ?? 0,
+            commentCount: note?.commentCount ?? 0,
+            canDownload,
+            onBack: () => navigate('/'),
+            onLike: () => void onLike(),
+            onComment: () => setSheetOpen(true),
+            onDownload: () => void onDownload(),
+          }}
+        />
+      ) : (
+        <div className="reader-page--state">
+          <div className="glass-panel" style={{ borderRadius: 16, padding: 24 }}>无法加载手账内容</div>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <Button icon={<IconLikeThumb />} theme={liked ? 'solid' : 'light'} type="primary" onClick={onLike}>
-            {note?.likeCount ?? 0}
-          </Button>
-          <Button icon={<IconComment />} theme="light" onClick={() => setSheetOpen(true)}>
-            评论 {note?.commentCount ?? 0}
-          </Button>
-          {canDownload ? (
-            <Button
-              icon={<IconDownload />}
-              theme="light"
-              onClick={async () => {
-                try {
-                  const res = await blogWS.request<NoteGetResponse & { exportUrl?: string }>('notes.get', { id });
-                  const url = res.exportUrl || '';
-                  if (!url) {
-                    throw new Error('download unavailable');
-                  }
-                  window.location.href = url.startsWith('http') ? url : `${location.origin}${url}`;
-                } catch (e) {
-                  Toast.error(String(e));
-                }
-              }}
-            >
-              下载
-            </Button>
-          ) : null}
-        </div>
-      </div>
-
-      {loaded?.document ? <ReaderView document={loaded.document} /> : (
-        <div className="glass" style={{ borderRadius: 16, padding: 24 }}>无法加载手账内容</div>
       )}
 
       <SideSheet
@@ -314,11 +323,11 @@ export function ReaderPage() {
             {comments.map((c) => {
               const av = avatarFor(c);
               return (
-                <div key={c.id} className="glass" style={{ borderRadius: 12, padding: 12, display: 'flex', gap: 10 }}>
+                <div key={c.id} className="comment-card" style={{ borderRadius: 12, padding: 12, display: 'flex', gap: 10 }}>
                   {typeof av === 'string' ? (
                     <img src={av} alt="" width={40} height={40} style={{ borderRadius: '50%' }} />
                   ) : (
-                    <div style={{ width: 40, height: 40, borderRadius: '50%', background: av.color, display: 'grid', placeItems: 'center', fontWeight: 700 }}>
+                    <div style={{ width: 40, height: 40, borderRadius: '50%', background: av.color, display: 'grid', placeItems: 'center', fontWeight: 700, color: '#fff' }}>
                       {av.ch}
                     </div>
                   )}
@@ -326,7 +335,7 @@ export function ReaderPage() {
                     <div style={{ fontWeight: 600 }}>{c.nickname}</div>
                     <div className="muted" style={{ fontSize: 12 }}>
                       {c.githubUrl ? (
-                        <a href={c.githubUrl} target="_blank" rel="noreferrer" style={{ color: '#7dd3fc' }}>
+                        <a href={c.githubUrl} target="_blank" rel="noreferrer">
                           {c.githubUrl}
                         </a>
                       ) : (

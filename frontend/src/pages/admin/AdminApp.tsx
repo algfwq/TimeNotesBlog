@@ -1,10 +1,20 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Button, Checkbox, Input, Modal, Select, Switch, Table, TabPane, Tabs, Toast, Typography, Upload } from '@douyinfe/semi-ui';
-import { IconCloud, IconDelete, IconDownload, IconEyeOpened, IconUser, IconHistogram } from '@douyinfe/semi-icons';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import {
+  Button, Checkbox, Empty, Input, Modal, Select, Slider, Switch, Tag,
+  Table, Toast, Typography, Upload,
+} from '@douyinfe/semi-ui';
+import {
+  IconBook, IconCloud, IconComment, IconDelete, IconDownload, IconEyeOpened,
+  IconHistogram, IconLikeThumb, IconLock, IconExit, IconSetting, IconUser, IconHome,
+} from '@douyinfe/semi-icons';
 import { VChart } from '@visactor/react-vchart';
 import { blogWS } from '../../lib/wsClient';
-import { applyDarkTheme } from '../../theme';
+import { useTheme } from '../../theme';
+import { ThemeToggle } from '../../components/ThemeToggle';
 import { AdminCredentialMigrationModal } from '../../components/AdminCredentialMigrationModal';
+import { WorldMapChart } from '../../components/WorldMapChart';
+import { defaultSiteSettings, resolveHeroBackground, type SiteSettings } from '../../types/site';
+import './admin.css';
 
 type User = {
   id: string;
@@ -33,34 +43,36 @@ type Stats = {
   recentCount: number;
   daily: Array<{ date: string; count: number }>;
   locations: Array<{ country: string; region: string; city: string; lat: number; lng: number; count: number }>;
+  countries?: Array<{ country: string; count: number }>;
   noteStats: Array<{ noteId: string; title: string; likeCount: number; commentCount: number; visible: boolean }>;
 };
 
 const TOKEN_KEY = 'tn_blog_admin_token';
 
-const darkChartCommon = {
-  background: 'transparent',
-  color: ['#7dd3fc', '#a78bfa', '#34d399', '#fbbf24'],
-  title: {
-    textStyle: { fill: '#f4f1ea', fontSize: 14, fontWeight: 600 },
-  },
-  axes: [
-    {
-      orient: 'left',
-      label: { style: { fill: 'rgba(244,241,234,0.7)' } },
-      grid: { style: { stroke: 'rgba(255,255,255,0.08)' } },
-      domainLine: { style: { stroke: 'rgba(255,255,255,0.15)' } },
-    },
-    {
-      orient: 'bottom',
-      label: { style: { fill: 'rgba(244,241,234,0.7)' } },
-      grid: { visible: false },
-      domainLine: { style: { stroke: 'rgba(255,255,255,0.15)' } },
-    },
-  ],
-};
+const NAV_ITEMS: Array<{ key: string; label: string; desc: string; icon: ReactNode }> = [
+  { key: 'dash', label: '仪表盘', desc: '访问趋势、地图与互动概览', icon: <IconHistogram /> },
+  { key: 'notes', label: '手账管理', desc: '上传、可见性、公开下载与客户端编辑', icon: <IconCloud /> },
+  { key: 'users', label: '用户管理', desc: '角色、上传权限与所有权转移', icon: <IconUser /> },
+  { key: 'site', label: '站点外观', desc: 'Hero 标题、背景与遮罩实时发布', icon: <IconHome /> },
+  { key: 'account', label: '账号安全', desc: '修改当前管理员用户名与密码', icon: <IconSetting /> },
+];
+
+function chartColors(isDark: boolean) {
+  return {
+    background: 'transparent',
+    color: isDark ? ['#7dd3fc', '#a78bfa', '#34d399', '#fbbf24'] : ['#2563eb', '#7c3aed', '#059669', '#d97706'],
+    titleFill: isDark ? '#f4f1ea' : '#1f2430',
+    labelFill: isDark ? 'rgba(244,241,234,0.7)' : 'rgba(31,36,48,0.65)',
+    grid: isDark ? 'rgba(255,255,255,0.08)' : 'rgba(15,23,42,0.08)',
+    domain: isDark ? 'rgba(255,255,255,0.15)' : 'rgba(15,23,42,0.15)',
+  };
+}
 
 export function AdminApp() {
+  const { mode } = useTheme();
+  const isDark = mode === 'dark';
+  const colors = chartColors(isDark);
+
   const [token, setToken] = useState(localStorage.getItem(TOKEN_KEY) || '');
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
@@ -69,6 +81,9 @@ export function AdminApp() {
   const [users, setUsers] = useState<User[]>([]);
   const [notes, setNotes] = useState<Note[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
+  const [settings, setSettings] = useState<SiteSettings>(defaultSiteSettings());
+  const [settingsDraft, setSettingsDraft] = useState<SiteSettings>(defaultSiteSettings());
+  const [savingSettings, setSavingSettings] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [newUser, setNewUser] = useState({ username: '', password: '', role: 'user', canUpload: true });
@@ -79,10 +94,9 @@ export function AdminApp() {
   const [editForm, setEditForm] = useState({ username: '', password: '', role: 'user', canUpload: true });
   const [deleteUser, setDeleteUser] = useState<User | null>(null);
   const [transferTo, setTransferTo] = useState('');
-
-  useEffect(() => {
-    applyDarkTheme();
-  }, []);
+  const [navKey, setNavKey] = useState('dash');
+  const [selfForm, setSelfForm] = useState({ username: '', password: '', password2: '' });
+  const [selfSaving, setSelfSaving] = useState(false);
 
   const mapError = (e: unknown) => {
     const msg = String(e);
@@ -109,6 +123,7 @@ export function AdminApp() {
       canUpload: Boolean(res.canUpload),
       mustChangeCredentials: Boolean(res.mustChangeCredentials),
     });
+    setSelfForm((s) => ({ ...s, username: res.username }));
     setMustChange(Boolean(res.mustChangeCredentials));
     setAuthed(true);
   };
@@ -118,14 +133,10 @@ export function AdminApp() {
     try {
       await blogWS.connect();
       const res = await blogWS.login(username, password);
-      if (res.role !== 'admin') {
-        throw new Error('需要管理员账号');
-      }
+      if (res.role !== 'admin') throw new Error('需要管理员账号');
       applySession(res);
       Toast.success('登录成功');
-      if (!res.mustChangeCredentials) {
-        await refreshAll();
-      }
+      if (!res.mustChangeCredentials) await refreshAll();
     } catch (e) {
       Toast.error(mapError(e));
     } finally {
@@ -140,9 +151,7 @@ export function AdminApp() {
       const res = await blogWS.loginWithToken(token);
       if (res.role !== 'admin') throw new Error('需要管理员账号');
       applySession({ ...res, token });
-      if (!res.mustChangeCredentials) {
-        await refreshAll();
-      }
+      if (!res.mustChangeCredentials) await refreshAll();
     } catch {
       localStorage.removeItem(TOKEN_KEY);
       setToken('');
@@ -153,14 +162,18 @@ export function AdminApp() {
   };
 
   const refreshAll = async () => {
-    const [u, n, s] = await Promise.all([
+    const [u, n, s, site] = await Promise.all([
       blogWS.request<{ users: User[] }>('admin.users.list', {}),
       blogWS.request<{ notes: Note[] }>('admin.notes.list', {}),
       blogWS.request<Stats>('admin.stats', {}),
+      blogWS.request<{ settings: SiteSettings }>('admin.site.get', {}).catch(() => ({ settings: defaultSiteSettings() })),
     ]);
     setUsers(u.users || []);
     setNotes(n.notes || []);
     setStats(s);
+    const next = { ...defaultSiteSettings(), ...(site.settings || {}) };
+    setSettings(next);
+    setSettingsDraft(next);
   };
 
   useEffect(() => {
@@ -177,6 +190,14 @@ export function AdminApp() {
       blogWS.on('event.stats.changed', () => { void refreshAll(); }),
       blogWS.on('event.like.changed', () => { void refreshAll(); }),
       blogWS.on('event.comment.created', () => { void refreshAll(); }),
+      blogWS.on('event.site-settings.changed', (payload) => {
+        const p = payload as { settings?: SiteSettings };
+        if (p.settings) {
+          const next = { ...defaultSiteSettings(), ...p.settings };
+          setSettings(next);
+          setSettingsDraft(next);
+        }
+      }),
       blogWS.onSnapshot(async () => { if (authed && !mustChange) await refreshAll(); }),
     ];
     return () => unsubs.forEach((u) => u());
@@ -218,59 +239,28 @@ export function AdminApp() {
       data: [{ id: 'daily', values: values.length ? values : [{ date: '-', count: 0 }] }],
       xField: 'date',
       yField: 'count',
-      title: { text: '近 14 日访问量', ...darkChartCommon.title },
+      title: { text: '近 14 日访问量', textStyle: { fill: colors.titleFill, fontSize: 14, fontWeight: 600 } },
       background: 'transparent',
-      color: darkChartCommon.color,
+      color: colors.color,
       area: { style: { fillOpacity: 0.25 } },
-      line: { style: { stroke: '#7dd3fc', lineWidth: 2 } },
-      point: { style: { fill: '#7dd3fc', stroke: '#0b0d12', lineWidth: 1 } },
-      axes: darkChartCommon.axes,
-    };
-  }, [stats]);
-
-  const mapSpec = useMemo(() => {
-    const values = (stats?.locations || []).map((l) => ({
-      lat: l.lat,
-      lng: l.lng,
-      size: l.count,
-      name: [l.city, l.region, l.country].filter(Boolean).join(', '),
-    }));
-    return {
-      type: 'common',
-      background: 'transparent',
-      color: darkChartCommon.color,
-      data: [{ id: 'loc', values: values.length ? values : [{ lat: 0, lng: 0, size: 1, name: '暂无' }] }],
-      series: [
-        {
-          type: 'scatter',
-          xField: 'lng',
-          yField: 'lat',
-          sizeField: 'size',
-          size: { type: 'linear', range: [6, 24] },
-          point: { style: { fill: '#60a5fa', fillOpacity: 0.8, stroke: '#e0f2fe' } },
-        },
-      ],
-      title: { text: '访客地理分布（散点近似）', ...darkChartCommon.title },
+      line: { style: { stroke: colors.color[0], lineWidth: 2 } },
+      point: { style: { fill: colors.color[0], lineWidth: 1 } },
       axes: [
         {
           orient: 'left',
-          title: { text: 'Lat', style: { fill: 'rgba(244,241,234,0.7)' } },
-          min: -90,
-          max: 90,
-          label: { style: { fill: 'rgba(244,241,234,0.7)' } },
-          grid: { style: { stroke: 'rgba(255,255,255,0.08)' } },
+          label: { style: { fill: colors.labelFill } },
+          grid: { style: { stroke: colors.grid } },
+          domainLine: { style: { stroke: colors.domain } },
         },
         {
           orient: 'bottom',
-          title: { text: 'Lng', style: { fill: 'rgba(244,241,234,0.7)' } },
-          min: -180,
-          max: 180,
-          label: { style: { fill: 'rgba(244,241,234,0.7)' } },
-          grid: { style: { stroke: 'rgba(255,255,255,0.08)' } },
+          label: { style: { fill: colors.labelFill } },
+          grid: { visible: false },
+          domainLine: { style: { stroke: colors.domain } },
         },
       ],
     };
-  }, [stats]);
+  }, [stats, colors]);
 
   const uploadFile = async (file: File) => {
     const buf = await file.arrayBuffer();
@@ -349,14 +339,8 @@ export function AdminApp() {
     const name = newUser.username.trim();
     const pass = newUser.password;
     const role = newUser.role === 'admin' ? 'admin' : 'user';
-    if (!name) {
-      Toast.warning('请填写用户名');
-      return;
-    }
-    if (!pass) {
-      Toast.warning('请填写密码');
-      return;
-    }
+    if (!name) { Toast.warning('请填写用户名'); return; }
+    if (!pass) { Toast.warning('请填写密码'); return; }
     setCreating(true);
     try {
       await blogWS.request('admin.users.create', {
@@ -376,260 +360,701 @@ export function AdminApp() {
     }
   };
 
+  const saveSiteSettings = async () => {
+    setSavingSettings(true);
+    try {
+      const res = await blogWS.request<{ settings: SiteSettings }>('admin.site.update', {
+        heroTitle: settingsDraft.heroTitle,
+        heroSubtitle: settingsDraft.heroSubtitle,
+        backgroundMode: settingsDraft.backgroundMode,
+        backgroundUrl: settingsDraft.backgroundUrl || '',
+        focusX: settingsDraft.focusX,
+        focusY: settingsDraft.focusY,
+        overlayColor: settingsDraft.overlayColor,
+        overlayOpacity: settingsDraft.overlayOpacity,
+      });
+      const next = { ...defaultSiteSettings(), ...(res.settings || {}) };
+      setSettings(next);
+      setSettingsDraft(next);
+      Toast.success('站点外观已发布');
+    } catch (e) {
+      Toast.error(mapError(e));
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const uploadHero = async (file: File) => {
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    const data = btoa(binary);
+    const res = await blogWS.request<{ settings: SiteSettings }>('admin.site.background.upload', {
+      data,
+      name: file.name,
+    }, 60000);
+    const next = { ...defaultSiteSettings(), ...(res.settings || {}) };
+    setSettings(next);
+    setSettingsDraft(next);
+    Toast.success('背景图已上传');
+  };
+
+  const saveSelf = async () => {
+    if (selfForm.password && selfForm.password !== selfForm.password2) {
+      Toast.warning('两次密码不一致');
+      return;
+    }
+    setSelfSaving(true);
+    try {
+      const res = await blogWS.request<{ ok: boolean; username: string }>('admin.self.update', {
+        username: selfForm.username.trim() || undefined,
+        password: selfForm.password || undefined,
+      });
+      setSessionUser((u) => (u ? { ...u, username: res.username } : u));
+      setSelfForm((s) => ({ ...s, username: res.username, password: '', password2: '' }));
+      Toast.success('账号已更新');
+    } catch (e) {
+      Toast.error(mapError(e));
+    } finally {
+      setSelfSaving(false);
+    }
+  };
+
+  const coverOf = (note: Note) => {
+    if (!note.coverUrl) return '';
+    return note.coverUrl.startsWith('http') ? note.coverUrl : `${location.origin}${note.coverUrl}`;
+  };
+
+  const heroPreview = useMemo(() => resolveHeroBackground(settingsDraft), [settingsDraft]);
+  const heroOverlay = useMemo(() => {
+    const h = (settingsDraft.overlayColor || '#0b0d12').replace('#', '');
+    if (h.length !== 6) return `rgba(11,13,18,${settingsDraft.overlayOpacity})`;
+    const r = parseInt(h.slice(0, 2), 16);
+    const g = parseInt(h.slice(2, 4), 16);
+    const b = parseInt(h.slice(4, 6), 16);
+    return `rgba(${r},${g},${b},${settingsDraft.overlayOpacity})`;
+  }, [settingsDraft]);
+
   if (!authed) {
     return (
-      <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', padding: 20 }}>
-        <div className="glass-strong" style={{ width: 'min(400px, 100%)', borderRadius: 18, padding: 24 }}>
-          <Typography.Title heading={3} style={{ color: '#f4f1ea', marginTop: 0 }}>后台登录</Typography.Title>
-          <p className="muted">使用管理员账号登录（含 PoW 验证）</p>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 16 }}>
+      <div className="admin-app admin-login">
+        <div className="admin-login-shell">
+          <div className="admin-login-brand">
             <div>
-              <label className="field-label">用户名</label>
-              <Input prefix={<IconUser />} value={username} onChange={setUsername} placeholder="admin" />
+              <div className="admin-login-mark"><IconBook /></div>
+              <h1>TimeNotes<br />管理控制台</h1>
+              <p>管理公开手账、用户权限、站点外观与访问统计。登录包含 PoW 工作量验证，请使用管理员账号。</p>
+              <div className="admin-login-pills">
+                <span className="admin-login-pill">PoW 防爆破</span>
+                <span className="admin-login-pill">JWT 会话</span>
+                <span className="admin-login-pill">实时事件</span>
+              </div>
             </div>
-            <div>
-              <label className="field-label">密码</label>
-              <Input mode="password" value={password} onChange={setPassword} placeholder="密码" onEnterPress={login} />
+            <div className="admin-login-foot">TimeNotes Blog Admin · 仅授权人员访问</div>
+          </div>
+          <div className="admin-login-form">
+            <div className="admin-login-form-top">
+              <div>
+                <h2>欢迎回来</h2>
+                <p className="hint">输入管理员凭据以进入后台</p>
+              </div>
+              <ThemeToggle size="small" />
             </div>
-            <Button theme="solid" type="primary" loading={busy} onClick={login}>登录</Button>
+            <div className="admin-login-fields">
+              <div>
+                <label className="field-label">用户名</label>
+                <Input prefix={<IconUser />} value={username} onChange={setUsername} placeholder="管理员用户名" size="large" />
+              </div>
+              <div>
+                <label className="field-label">密码</label>
+                <Input
+                  prefix={<IconLock />}
+                  mode="password"
+                  value={password}
+                  onChange={setPassword}
+                  placeholder="登录密码"
+                  size="large"
+                  onEnterPress={login}
+                />
+              </div>
+              <Button className="admin-login-submit" theme="solid" type="primary" loading={busy} onClick={login} block>
+                登录后台
+              </Button>
+            </div>
           </div>
         </div>
       </div>
     );
   }
 
+  const activeNav = NAV_ITEMS.find((n) => n.key === navKey) || NAV_ITEMS[0];
+  const totalLikes = (stats?.noteStats || []).reduce((s, n) => s + (n.likeCount || 0), 0);
+  const totalComments = (stats?.noteStats || []).reduce((s, n) => s + (n.commentCount || 0), 0);
+  const userInitial = (sessionUser?.username || 'A').trim().charAt(0).toUpperCase();
+
   return (
-    <div className="admin-layout">
-      <aside className="admin-side glass-strong">
-        <Typography.Title heading={4} style={{ color: '#f4f1ea', marginTop: 0 }}>TimeNotes Admin</Typography.Title>
-        <p className="muted" style={{ fontSize: 12 }}>安全后台 · {sessionUser?.username || '管理员'}</p>
-        <Button block theme="borderless" type="danger" style={{ marginTop: 16 }} onClick={() => {
-          localStorage.removeItem(TOKEN_KEY);
-          setAuthed(false);
-          setToken('');
-        }}>
-          退出登录
-        </Button>
-      </aside>
-      <main className="admin-main">
-        <Tabs type="line" keepDOM={false}>
-          <TabPane tab={<span><IconHistogram /> 仪表盘</span>} itemKey="dash">
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(180px,1fr))', gap: 12, marginBottom: 16 }}>
-              <div className="glass" style={{ borderRadius: 14, padding: 16 }}>
-                <div className="muted">今日访问</div>
-                <div style={{ fontSize: 28, fontWeight: 700, color: '#f4f1ea' }}>{stats?.todayCount ?? 0}</div>
-              </div>
-              <div className="glass" style={{ borderRadius: 14, padding: 16 }}>
-                <div className="muted">近 14 日访问</div>
-                <div style={{ fontSize: 28, fontWeight: 700, color: '#f4f1ea' }}>{stats?.recentCount ?? 0}</div>
-              </div>
-              <div className="glass" style={{ borderRadius: 14, padding: 16 }}>
-                <div className="muted">手账数</div>
-                <div style={{ fontSize: 28, fontWeight: 700, color: '#f4f1ea' }}>{notes.length}</div>
-              </div>
+    <div className="admin-app">
+      <div className="admin-shell">
+        <aside className="admin-sidebar">
+          <div className="admin-brand">
+            <div className="admin-brand-mark"><IconBook /></div>
+            <div className="admin-brand-text">
+              <div className="admin-brand-title">TimeNotes</div>
+              <div className="admin-brand-sub">Admin Console</div>
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: 12 }}>
-              <div className="chart-panel">
-                {stats ? <VChart spec={visitSpec as never} /> : null}
-              </div>
-              <div className="chart-panel">
-                {stats ? <VChart spec={mapSpec as never} /> : null}
-              </div>
-            </div>
-            <div className="glass" style={{ borderRadius: 14, padding: 12, marginTop: 12 }}>
-              <Typography.Title heading={5} style={{ color: '#f4f1ea' }}>手账互动</Typography.Title>
-              <Table
-                dataSource={stats?.noteStats || []}
-                rowKey="noteId"
-                pagination={false}
-                empty={<span className="muted">暂无数据</span>}
-                columns={[
-                  { title: '标题', dataIndex: 'title' },
-                  { title: '点赞', dataIndex: 'likeCount', width: 90 },
-                  { title: '评论', dataIndex: 'commentCount', width: 90 },
-                  { title: '可见', dataIndex: 'visible', width: 90, render: (v) => (v ? '是' : '否') },
-                ]}
-              />
-            </div>
-          </TabPane>
+          </div>
 
-          <TabPane tab={<span><IconCloud /> 手账管理</span>} itemKey="notes">
-            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-              <Upload
-                action=""
-                accept=".tnote"
-                showUploadList={false}
-                customRequest={async ({ file, onSuccess, onError }) => {
-                  try {
-                    const raw = (file as { fileInstance?: File }).fileInstance || (file as unknown as File);
-                    await uploadFile(raw);
-                    onSuccess?.({});
-                  } catch (e) {
-                    Toast.error(mapError(e));
-                    onError?.({ status: 500 });
-                  }
-                }}
+          <nav className="admin-nav">
+            {NAV_ITEMS.map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                className={`admin-nav-item ${navKey === item.key ? 'is-active' : ''}`}
+                onClick={() => setNavKey(item.key)}
               >
-                <Button theme="solid" type="primary">上传 .tnote</Button>
-              </Upload>
-              <Button theme="light" onClick={() => void refreshAll()}>刷新</Button>
-            </div>
-            <div className="glass" style={{ borderRadius: 14, padding: 8 }}>
-              <Table
-                dataSource={notes}
-                rowKey="id"
-                empty={<span className="muted">暂无手账</span>}
-                columns={[
-                  { title: '标题', dataIndex: 'title' },
-                  { title: '文件名', dataIndex: 'filename' },
-                  { title: '上传者', dataIndex: 'ownerName' },
-                  { title: '点赞', dataIndex: 'likeCount', width: 80 },
-                  { title: '评论', dataIndex: 'commentCount', width: 80 },
-                  {
-                    title: '可见',
-                    dataIndex: 'visible',
-                    width: 90,
-                    render: (v: boolean, r: Note) => (
-                      <Switch
-                        checked={v}
-                        onChange={async (checked) => {
-                          try {
-                            await blogWS.request('admin.notes.set_visible', { id: r.id, visible: checked });
-                          } catch (e) {
-                            Toast.error(mapError(e));
-                          }
-                        }}
-                      />
-                    ),
-                  },
-                  {
-                    title: '公开下载',
-                    dataIndex: 'publicDownload',
-                    width: 100,
-                    render: (v: boolean, r: Note) => (
-                      <Switch
-                        checked={Boolean(v)}
-                        onChange={async (checked) => {
-                          try {
-                            await blogWS.request('admin.notes.set_public_download', { id: r.id, enabled: checked });
-                          } catch (e) {
-                            Toast.error(mapError(e));
-                          }
-                        }}
-                      />
-                    ),
-                  },
-                  {
-                    title: '操作',
-                    width: 280,
-                    render: (_: unknown, r: Note) => (
-                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                        <Button size="small" theme="light" icon={<IconDownload />} onClick={() => void downloadNote(r)}>下载</Button>
-                        <Button size="small" theme="light" icon={<IconEyeOpened />} onClick={() => void openInClient(r)}>编辑</Button>
-                        <Button
-                          size="small"
-                          type="danger"
-                          theme="light"
-                          icon={<IconDelete />}
-                          onClick={async () => {
-                            try {
-                              await blogWS.request('admin.notes.delete', { id: r.id });
-                              Toast.success('已删除');
-                            } catch (e) {
-                              Toast.error(mapError(e));
-                            }
-                          }}
-                        >
-                          删除
-                        </Button>
-                      </div>
-                    ),
-                  },
-                ]}
-              />
-            </div>
-          </TabPane>
+                <span className="icon">{item.icon}</span>
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </nav>
 
-          <TabPane tab={<span><IconUser /> 用户管理</span>} itemKey="users">
-            <div style={{ marginBottom: 12 }}>
-              <Button theme="solid" type="primary" onClick={() => setCreateOpen(true)}>添加用户</Button>
+          <div className="admin-sidebar-foot">
+            <div className="admin-user-chip">
+              <div className="admin-user-avatar">{userInitial}</div>
+              <div className="admin-user-meta">
+                <div className="admin-user-name">{sessionUser?.username || '管理员'}</div>
+                <div className="admin-user-role">Administrator</div>
+              </div>
             </div>
-            <div className="glass" style={{ borderRadius: 14, padding: 8 }}>
-              <Table
-                dataSource={users}
-                rowKey="id"
-                empty={<span className="muted">暂无用户</span>}
-                columns={[
-                  { title: '用户名', dataIndex: 'username' },
-                  { title: '角色', dataIndex: 'role', width: 100 },
-                  {
-                    title: '可上传',
-                    dataIndex: 'canUpload',
-                    width: 100,
-                    render: (v: boolean, r: User) => (
-                      <Switch
-                        checked={v}
-                        onChange={async (checked) => {
-                          await blogWS.request('admin.users.update', { id: r.id, canUpload: checked });
-                          await refreshAll();
-                        }}
-                      />
-                    ),
-                  },
-                  {
-                    title: '设为管理员',
-                    width: 120,
-                    render: (_: unknown, r: User) => (
-                      <Switch
-                        checked={r.role === 'admin'}
-                        onChange={async (checked) => {
-                          await blogWS.request('admin.users.update', {
-                            id: r.id,
-                            role: checked ? 'admin' : 'user',
-                            canUpload: checked ? true : r.canUpload,
-                          });
-                          await refreshAll();
-                        }}
-                      />
-                    ),
-                  },
-                  {
-                    title: '操作',
-                    width: 180,
-                    render: (_: unknown, r: User) => (
-                      <div style={{ display: 'flex', gap: 6 }}>
-                        <Button
-                          size="small"
-                          theme="light"
-                          onClick={() => {
-                            setEditUser(r);
-                            setEditForm({ username: r.username, password: '', role: r.role, canUpload: r.canUpload });
-                          }}
-                        >
-                          编辑
-                        </Button>
-                        <Button
-                          size="small"
-                          type="danger"
-                          theme="light"
-                          onClick={() => {
-                            setDeleteUser(r);
-                            const admins = users.filter((u) => u.role === 'admin' && u.id !== r.id);
-                            setTransferTo(admins[0]?.id || '');
-                          }}
-                        >
-                          删除
-                        </Button>
-                      </div>
-                    ),
-                  },
-                ]}
-              />
-            </div>
-          </TabPane>
-        </Tabs>
-      </main>
+            <Button
+              block
+              type="danger"
+              theme="borderless"
+              icon={<IconExit />}
+              onClick={() => {
+                localStorage.removeItem(TOKEN_KEY);
+                setAuthed(false);
+                setToken('');
+                blogWS.setToken('');
+              }}
+            >
+              退出登录
+            </Button>
+          </div>
+        </aside>
 
+        <div className="admin-main">
+          <header className="admin-topbar">
+            <div className="admin-topbar-left">
+              <h1 className="admin-topbar-title">{activeNav.label}</h1>
+              <p className="admin-topbar-desc">{activeNav.desc}</p>
+            </div>
+            <div className="admin-topbar-actions">
+              <ThemeToggle />
+            </div>
+          </header>
+
+          <main className="admin-content">
+            {navKey === 'dash' ? (
+              <>
+                <div className="admin-stat-grid">
+                  <div className="admin-stat-card tone-blue">
+                    <div className="row">
+                      <div className="label">今日访问</div>
+                      <div className="icon-badge"><IconEyeOpened /></div>
+                    </div>
+                    <div className="value">{stats?.todayCount ?? 0}</div>
+                    <div className="hint">含首页与阅读页</div>
+                  </div>
+                  <div className="admin-stat-card tone-violet">
+                    <div className="row">
+                      <div className="label">近 14 日访问</div>
+                      <div className="icon-badge"><IconHistogram /></div>
+                    </div>
+                    <div className="value">{stats?.recentCount ?? 0}</div>
+                    <div className="hint">滚动窗口统计</div>
+                  </div>
+                  <div className="admin-stat-card tone-emerald">
+                    <div className="row">
+                      <div className="label">手账本</div>
+                      <div className="icon-badge"><IconBook /></div>
+                    </div>
+                    <div className="value">{notes.length}</div>
+                    <div className="hint">含隐藏手账</div>
+                  </div>
+                  <div className="admin-stat-card tone-amber">
+                    <div className="row">
+                      <div className="label">互动合计</div>
+                      <div className="icon-badge"><IconLikeThumb /></div>
+                    </div>
+                    <div className="value">{totalLikes + totalComments}</div>
+                    <div className="hint">点赞 {totalLikes} · 评论 {totalComments}</div>
+                  </div>
+                </div>
+
+                <div className="admin-chart-grid">
+                  <section className="admin-panel">
+                    <div className="admin-panel-head">
+                      <h3>访问趋势</h3>
+                      <Tag size="small" color="blue">14 日</Tag>
+                    </div>
+                    <div className="admin-panel-body">
+                      <div className="admin-chart-box">
+                        {stats ? <VChart spec={visitSpec as never} style={{ width: '100%', height: '100%' }} /> : null}
+                      </div>
+                    </div>
+                  </section>
+                  <section className="admin-panel">
+                    <div className="admin-panel-head">
+                      <h3>访客地理分布</h3>
+                      <Tag size="small" color="violet">World Map</Tag>
+                    </div>
+                    <div className="admin-panel-body">
+                      <div className="admin-chart-box">
+                        {stats ? (
+                          <WorldMapChart countries={stats.countries || []} locations={stats.locations || []} />
+                        ) : null}
+                      </div>
+                    </div>
+                  </section>
+                </div>
+
+                <section className="admin-panel">
+                  <div className="admin-panel-head">
+                    <h3>手账互动</h3>
+                    <span className="muted" style={{ fontSize: 12 }}>{(stats?.noteStats || []).length} 本</span>
+                  </div>
+                  <div className="admin-panel-body tight">
+                    <Table
+                      dataSource={stats?.noteStats || []}
+                      rowKey="noteId"
+                      pagination={false}
+                      empty={<Empty description="暂无数据" />}
+                      columns={[
+                        { title: '标题', dataIndex: 'title' },
+                        {
+                          title: '点赞',
+                          dataIndex: 'likeCount',
+                          width: 100,
+                          render: (v: number) => (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                              <IconLikeThumb size="small" /> {v}
+                            </span>
+                          ),
+                        },
+                        {
+                          title: '评论',
+                          dataIndex: 'commentCount',
+                          width: 100,
+                          render: (v: number) => (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                              <IconComment size="small" /> {v}
+                            </span>
+                          ),
+                        },
+                        {
+                          title: '状态',
+                          dataIndex: 'visible',
+                          width: 100,
+                          render: (v: boolean) => (
+                            <Tag size="small" color={v ? 'green' : 'grey'}>{v ? '公开' : '隐藏'}</Tag>
+                          ),
+                        },
+                      ]}
+                    />
+                  </div>
+                </section>
+              </>
+            ) : null}
+
+            {navKey === 'notes' ? (
+              <section className="admin-panel">
+                <div className="admin-panel-head">
+                  <div>
+                    <h3>手账列表</h3>
+                  </div>
+                  <Upload
+                    action=""
+                    accept=".tnote"
+                    showUploadList={false}
+                    customRequest={async ({ file, onSuccess, onError }) => {
+                      try {
+                        const raw = (file as { fileInstance?: File }).fileInstance || (file as unknown as File);
+                        await uploadFile(raw);
+                        onSuccess?.({});
+                      } catch (e) {
+                        Toast.error(mapError(e));
+                        onError?.({ status: 500 });
+                      }
+                    }}
+                  >
+                    <Button theme="solid" type="primary" icon={<IconCloud />}>上传 .tnote</Button>
+                  </Upload>
+                </div>
+                <div className="admin-panel-body tight">
+                  <Table
+                    dataSource={notes}
+                    rowKey="id"
+                    empty={<Empty description="暂无手账" />}
+                    columns={[
+                      {
+                        title: '手账',
+                        dataIndex: 'title',
+                        render: (_: unknown, r: Note) => {
+                          const src = coverOf(r);
+                          return (
+                            <div className="admin-note-cell">
+                              {src ? <img className="note-thumb" src={src} alt="" /> : <div className="note-thumb" />}
+                              <div className="meta">
+                                <div className="title">{r.title || '未命名'}</div>
+                                <div className="sub">{r.filename}</div>
+                              </div>
+                            </div>
+                          );
+                        },
+                      },
+                      { title: '上传者', dataIndex: 'ownerName', width: 110, render: (v: string) => `@${v || 'unknown'}` },
+                      {
+                        title: '互动',
+                        width: 120,
+                        render: (_: unknown, r: Note) => (
+                          <span className="muted" style={{ fontSize: 12 }}>
+                            <IconLikeThumb size="small" /> {r.likeCount} · <IconComment size="small" /> {r.commentCount}
+                          </span>
+                        ),
+                      },
+                      {
+                        title: '可见',
+                        dataIndex: 'visible',
+                        width: 90,
+                        render: (v: boolean, r: Note) => (
+                          <Switch
+                            checked={v}
+                            onChange={async (checked) => {
+                              try {
+                                await blogWS.request('admin.notes.set_visible', { id: r.id, visible: checked });
+                              } catch (e) {
+                                Toast.error(mapError(e));
+                              }
+                            }}
+                          />
+                        ),
+                      },
+                      {
+                        title: '公开下载',
+                        dataIndex: 'publicDownload',
+                        width: 100,
+                        render: (v: boolean, r: Note) => (
+                          <Switch
+                            checked={Boolean(v)}
+                            onChange={async (checked) => {
+                              try {
+                                await blogWS.request('admin.notes.set_public_download', { id: r.id, enabled: checked });
+                              } catch (e) {
+                                Toast.error(mapError(e));
+                              }
+                            }}
+                          />
+                        ),
+                      },
+                      {
+                        title: '操作',
+                        width: 230,
+                        render: (_: unknown, r: Note) => (
+                          <div className="admin-actions">
+                            <Button size="small" theme="light" icon={<IconDownload />} onClick={() => void downloadNote(r)}>下载</Button>
+                            <Button size="small" theme="light" icon={<IconEyeOpened />} onClick={() => void openInClient(r)}>编辑</Button>
+                            <Button
+                              size="small"
+                              type="danger"
+                              theme="light"
+                              icon={<IconDelete />}
+                              onClick={async () => {
+                                try {
+                                  await blogWS.request('admin.notes.delete', { id: r.id });
+                                  Toast.success('已删除');
+                                } catch (e) {
+                                  Toast.error(mapError(e));
+                                }
+                              }}
+                            >
+                              删除
+                            </Button>
+                          </div>
+                        ),
+                      },
+                    ]}
+                  />
+                </div>
+              </section>
+            ) : null}
+
+            {navKey === 'users' ? (
+              <section className="admin-panel">
+                <div className="admin-panel-head">
+                  <h3>用户列表</h3>
+                  <Button theme="solid" type="primary" icon={<IconUser />} onClick={() => setCreateOpen(true)}>添加用户</Button>
+                </div>
+                <div className="admin-panel-body">
+                  <div className="admin-alert">
+                    上传用户视为可信：手账内原始 HTML 会按原样渲染。删除用户前须将其手账转移给其他管理员；系统始终保留至少一名管理员。
+                  </div>
+                  <Table
+                    dataSource={users}
+                    rowKey="id"
+                    empty={<Empty description="暂无用户" />}
+                    columns={[
+                      {
+                        title: '用户',
+                        dataIndex: 'username',
+                        render: (v: string) => (
+                          <div className="admin-note-cell">
+                            <div className="admin-user-avatar" style={{ width: 32, height: 32, borderRadius: 10, fontSize: 13 }}>
+                              {(v || '?').charAt(0).toUpperCase()}
+                            </div>
+                            <div className="meta">
+                              <div className="title">{v}</div>
+                            </div>
+                          </div>
+                        ),
+                      },
+                      {
+                        title: '角色',
+                        dataIndex: 'role',
+                        width: 110,
+                        render: (v: string) => (
+                          <Tag size="small" color={v === 'admin' ? 'violet' : 'white'}>
+                            {v === 'admin' ? '管理员' : '普通用户'}
+                          </Tag>
+                        ),
+                      },
+                      {
+                        title: '可上传',
+                        dataIndex: 'canUpload',
+                        width: 100,
+                        render: (v: boolean, r: User) => (
+                          <Switch
+                            checked={v}
+                            onChange={async (checked) => {
+                              await blogWS.request('admin.users.update', { id: r.id, canUpload: checked });
+                              await refreshAll();
+                            }}
+                          />
+                        ),
+                      },
+                      {
+                        title: '设为管理员',
+                        width: 120,
+                        render: (_: unknown, r: User) => (
+                          <Switch
+                            checked={r.role === 'admin'}
+                            onChange={async (checked) => {
+                              try {
+                                await blogWS.request('admin.users.update', {
+                                  id: r.id,
+                                  role: checked ? 'admin' : 'user',
+                                  canUpload: checked ? true : r.canUpload,
+                                });
+                                await refreshAll();
+                              } catch (e) {
+                                Toast.error(mapError(e));
+                              }
+                            }}
+                          />
+                        ),
+                      },
+                      {
+                        title: '操作',
+                        width: 180,
+                        render: (_: unknown, r: User) => (
+                          <div className="admin-actions">
+                            <Button
+                              size="small"
+                              theme="light"
+                              onClick={() => {
+                                setEditUser(r);
+                                setEditForm({ username: r.username, password: '', role: r.role, canUpload: r.canUpload });
+                              }}
+                            >
+                              编辑
+                            </Button>
+                            <Button
+                              size="small"
+                              type="danger"
+                              theme="light"
+                              onClick={() => {
+                                setDeleteUser(r);
+                                const admins = users.filter((u) => u.role === 'admin' && u.id !== r.id);
+                                setTransferTo(admins[0]?.id || '');
+                              }}
+                            >
+                              删除
+                            </Button>
+                          </div>
+                        ),
+                      },
+                    ]}
+                  />
+                </div>
+              </section>
+            ) : null}
+
+            {navKey === 'site' ? (
+              <div className="admin-site-grid">
+                <section className="admin-panel">
+                  <div className="admin-panel-head">
+                    <h3>站点外观设置</h3>
+                    <Tag size="small" color="cyan">实时广播</Tag>
+                  </div>
+                  <div className="admin-panel-body">
+                    <div className="admin-form-stack">
+                      <div>
+                        <label className="field-label">Hero 标题</label>
+                        <Input value={settingsDraft.heroTitle} onChange={(v) => setSettingsDraft((s) => ({ ...s, heroTitle: v }))} />
+                      </div>
+                      <div>
+                        <label className="field-label">副标题</label>
+                        <Input value={settingsDraft.heroSubtitle} onChange={(v) => setSettingsDraft((s) => ({ ...s, heroSubtitle: v }))} />
+                      </div>
+                      <div>
+                        <label className="field-label">背景模式</label>
+                        <Select
+                          style={{ width: '100%' }}
+                          value={settingsDraft.backgroundMode}
+                          optionList={[
+                            { value: 'none', label: '默认渐变' },
+                            { value: 'url', label: '图片 URL' },
+                            { value: 'upload', label: '上传图片' },
+                          ]}
+                          onChange={(v) => setSettingsDraft((s) => ({ ...s, backgroundMode: String(v) as SiteSettings['backgroundMode'] }))}
+                        />
+                      </div>
+                      {settingsDraft.backgroundMode === 'url' ? (
+                        <div>
+                          <label className="field-label">背景 URL（https）</label>
+                          <Input value={settingsDraft.backgroundUrl || ''} onChange={(v) => setSettingsDraft((s) => ({ ...s, backgroundUrl: v }))} placeholder="https://..." />
+                        </div>
+                      ) : null}
+                      {settingsDraft.backgroundMode === 'upload' ? (
+                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                          <Upload
+                            action=""
+                            accept="image/png,image/jpeg,image/webp,image/gif"
+                            showUploadList={false}
+                            customRequest={async ({ file, onSuccess, onError }) => {
+                              try {
+                                const raw = (file as { fileInstance?: File }).fileInstance || (file as unknown as File);
+                                await uploadHero(raw);
+                                onSuccess?.({});
+                              } catch (e) {
+                                Toast.error(mapError(e));
+                                onError?.({ status: 500 });
+                              }
+                            }}
+                          >
+                            <Button theme="solid" type="primary">上传背景图</Button>
+                          </Upload>
+                          <Button
+                            type="danger"
+                            theme="light"
+                            onClick={async () => {
+                              try {
+                                const res = await blogWS.request<{ settings: SiteSettings }>('admin.site.update', { clearUpload: true, backgroundMode: 'none' });
+                                const next = { ...defaultSiteSettings(), ...(res.settings || {}) };
+                                setSettings(next);
+                                setSettingsDraft(next);
+                              } catch (e) {
+                                Toast.error(mapError(e));
+                              }
+                            }}
+                          >
+                            清除上传
+                          </Button>
+                        </div>
+                      ) : null}
+                      <div>
+                        <label className="field-label">焦点 X ({Math.round(settingsDraft.focusX)}%)</label>
+                        <Slider value={settingsDraft.focusX} min={0} max={100} onChange={(v) => setSettingsDraft((s) => ({ ...s, focusX: Number(v) }))} />
+                      </div>
+                      <div>
+                        <label className="field-label">焦点 Y ({Math.round(settingsDraft.focusY)}%)</label>
+                        <Slider value={settingsDraft.focusY} min={0} max={100} onChange={(v) => setSettingsDraft((s) => ({ ...s, focusY: Number(v) }))} />
+                      </div>
+                      <div>
+                        <label className="field-label">遮罩颜色</label>
+                        <Input value={settingsDraft.overlayColor} onChange={(v) => setSettingsDraft((s) => ({ ...s, overlayColor: v }))} placeholder="#0b0d12" />
+                      </div>
+                      <div>
+                        <label className="field-label">遮罩透明度 ({settingsDraft.overlayOpacity.toFixed(2)})</label>
+                        <Slider
+                          value={Math.round(settingsDraft.overlayOpacity * 100)}
+                          min={0}
+                          max={90}
+                          onChange={(v) => setSettingsDraft((s) => ({ ...s, overlayOpacity: Number(v) / 100 }))}
+                        />
+                      </div>
+                      <Button theme="solid" type="primary" loading={savingSettings} onClick={() => void saveSiteSettings()}>
+                        发布到公开首页
+                      </Button>
+                    </div>
+                  </div>
+                </section>
+                <section className="admin-panel">
+                  <div className="admin-panel-head">
+                    <h3>实时预览</h3>
+                    <Tag size="small" color="grey">{settings.backgroundMode}</Tag>
+                  </div>
+                  <div className="admin-panel-body">
+                    <div
+                      className="site-preview"
+                      style={{
+                        backgroundImage: heroPreview
+                          ? `linear-gradient(${heroOverlay}, ${heroOverlay}), url(${heroPreview})`
+                          : undefined,
+                        backgroundPosition: `${settingsDraft.focusX}% ${settingsDraft.focusY}%`,
+                      }}
+                    >
+                      <div>
+                        <div className="site-preview-title">{settingsDraft.heroTitle}</div>
+                        <div className="site-preview-sub">{settingsDraft.heroSubtitle}</div>
+                      </div>
+                    </div>
+                    <Typography.Text type="tertiary" style={{ display: 'block', marginTop: 12, fontSize: 12 }}>
+                      线上：{settings.heroTitle} · 模式 {settings.backgroundMode}
+                    </Typography.Text>
+                  </div>
+                </section>
+              </div>
+            ) : null}
+
+            {navKey === 'account' ? (
+              <section className="admin-panel admin-account-panel">
+                <div className="admin-panel-head">
+                  <h3>当前账号安全</h3>
+                </div>
+                <div className="admin-panel-body">
+                  <div className="admin-form-stack">
+                    <div>
+                      <label className="field-label">用户名</label>
+                      <Input value={selfForm.username} onChange={(v) => setSelfForm((s) => ({ ...s, username: v }))} />
+                    </div>
+                    <div>
+                      <label className="field-label">新密码（留空不改）</label>
+                      <Input mode="password" value={selfForm.password} onChange={(v) => setSelfForm((s) => ({ ...s, password: v }))} />
+                    </div>
+                    <div>
+                      <label className="field-label">确认新密码</label>
+                      <Input mode="password" value={selfForm.password2} onChange={(v) => setSelfForm((s) => ({ ...s, password2: v }))} />
+                    </div>
+                    <Button theme="solid" type="primary" loading={selfSaving} onClick={() => void saveSelf()}>保存更改</Button>
+                  </div>
+                </div>
+              </section>
+            ) : null}
+          </main>
+        </div>
+      </div>
 
       <AdminCredentialMigrationModal
         visible={authed && mustChange}
@@ -655,6 +1080,7 @@ export function AdminApp() {
             });
             Toast.success('用户已更新');
             setEditUser(null);
+            await refreshAll();
           } catch (e) {
             Toast.error(mapError(e));
           }
@@ -694,6 +1120,7 @@ export function AdminApp() {
             });
             Toast.success('用户已删除');
             setDeleteUser(null);
+            await refreshAll();
           } catch (e) {
             Toast.error(mapError(e));
           }
@@ -726,20 +1153,11 @@ export function AdminApp() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <div>
             <label className="field-label">用户名（不可重名）</label>
-            <Input
-              placeholder="例如 editor01"
-              value={newUser.username}
-              onChange={(v) => setNewUser((s) => ({ ...s, username: v }))}
-            />
+            <Input placeholder="例如 editor01" value={newUser.username} onChange={(v) => setNewUser((s) => ({ ...s, username: v }))} />
           </div>
           <div>
             <label className="field-label">密码</label>
-            <Input
-              mode="password"
-              placeholder="登录密码"
-              value={newUser.password}
-              onChange={(v) => setNewUser((s) => ({ ...s, password: v }))}
-            />
+            <Input mode="password" placeholder="登录密码" value={newUser.password} onChange={(v) => setNewUser((s) => ({ ...s, password: v }))} />
           </div>
           <div>
             <label className="field-label">角色</label>
@@ -752,11 +1170,7 @@ export function AdminApp() {
               ]}
               onChange={(v) => {
                 const role = String(v) === 'admin' ? 'admin' : 'user';
-                setNewUser((s) => ({
-                  ...s,
-                  role,
-                  canUpload: role === 'admin' ? true : s.canUpload,
-                }));
+                setNewUser((s) => ({ ...s, role, canUpload: role === 'admin' ? true : s.canUpload }));
               }}
             />
           </div>
