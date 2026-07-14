@@ -7,6 +7,64 @@ TimeNotes 手账本的公开展示与协作上传服务。
 - **部署形态**：前端 `npm run build` 产物输出到 `web/`，由后端同端口托管
 - **业务 API**：几乎全部走 WebSocket；HTTP 仅用于静态页、健康检查、`.tnote` 下载
 
+<p align="center">
+  <img alt="Version" src="https://img.shields.io/badge/version-2.9.0-blue?style=flat-square" />
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square" />
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20amd64-5B8DEF?style=flat-square" />
+</p>
+
+## 💝 支持项目
+
+<p align="center">
+  TimeNotes 是独立开发者用爱发电的开源项目，完全免费。<br/>
+  如果它帮你写出了更棒的手账，欢迎请开发者喝杯咖啡 ☕
+</p>
+
+<p align="center">
+  <a href="https://ifdian.net/a/algfwq">
+    <img src="./afdian-sponsor.jpg" alt="爱发电赞助 TimeNotes" width="480" />
+  </a>
+</p>
+
+<p align="center">
+  👉 <a href="https://ifdian.net/a/algfwq"><strong>前往爱发电支持 TimeNotes</strong></a>
+</p>
+
+## 版本 2.9.0 更新摘要
+
+- 生产构建产物统一命名：`TimeNotesBlog-2.9.0-{arch}-{os}`（内嵌当前 `web/` 前端构建）。
+- 与客户端 2.9.0 对齐：桌面 / Android 均可「连接到 Blog」上传或更新完整 `.tnote`。
+- 客户端 Android 侧通过原生 Go 代理发起 Blog WebSocket，避免 `https://wails.localhost` 混合内容拦截。
+- 账号体系：管理员后台发号、argon2id 密码、PoW 登录、JWT 会话；后台路径 token 每次启动随机。
+- 互动：按 IP 点赞、评论、访问统计与可插拔 GeoIP。
+
+## 发布产物（v2.9.0）
+
+位于 `bin/`，命名规则：`TimeNotesBlog-{version}-{arch}-{os}`。
+
+| 文件 | 说明 |
+|------|------|
+| `bin/TimeNotesBlog-2.9.0-amd64-windows.exe` | Windows amd64 生产可执行文件（含前端静态资源） |
+| `bin/TimeNotesBlog-2.9.0-amd64-linux` | Linux amd64 生产可执行文件（含前端静态资源） |
+
+```powershell
+# 先构建前端再打包二进制
+cd frontend
+npm install
+npm run build   # 输出到 ../web/
+cd ..
+
+# Windows amd64
+$env:CGO_ENABLED=0; $env:GOOS="windows"; $env:GOARCH="amd64"
+go build -trimpath -ldflags="-s -w" -o bin/TimeNotesBlog-2.9.0-amd64-windows.exe .
+
+# Linux amd64
+$env:CGO_ENABLED=0; $env:GOOS="linux"; $env:GOARCH="amd64"
+go build -trimpath -ldflags="-s -w" -o bin/TimeNotesBlog-2.9.0-amd64-linux .
+```
+
+运行前请复制并修改 `config.example.json` → `config.json`，生产必须设置强 `jwtSecret`。
+
 ---
 
 ## 功能概览
@@ -74,9 +132,10 @@ cp config.example.json config.json
 ```bash
 cd TimeNotesBlog
 go run .
-# 或
-go build -o bin/timenotesblog .
-./bin/timenotesblog
+# 或使用 v2.9.0 发布产物
+./bin/TimeNotesBlog-2.9.0-amd64-linux
+# Windows:
+# .\bin\TimeNotesBlog-2.9.0-amd64-windows.exe
 ```
 
 启动日志会打印：
