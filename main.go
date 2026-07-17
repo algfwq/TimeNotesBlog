@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"embed"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/url"
@@ -25,6 +27,12 @@ import (
 	"timenotesblog/internal/server"
 	"timenotesblog/internal/storage/sqlite"
 )
+
+// Frontend production build (npm run build → web/). Embedded into the binary so
+// a single executable can be deployed without a sibling web/ directory.
+//
+//go:embed all:web
+var embeddedWeb embed.FS
 
 func main() {
 	cfg, err := loadConfig()
@@ -141,13 +149,12 @@ func main() {
 	})
 	hub.RegisterRoutes(app)
 
-	webDir := filepath.Join("web")
-	if _, err := os.Stat(filepath.Join(webDir, "index.html")); err != nil {
-		// minimal placeholder so server can start before frontend build
-		_ = os.MkdirAll(webDir, 0o755)
-		_ = os.WriteFile(filepath.Join(webDir, "index.html"), []byte(placeholderHTML), 0o644)
+	webFS, webSource, err := openWebFS()
+	if err != nil {
+		log.Fatalf("web static assets: %v", err)
 	}
-	server.MountStatic(app, webDir, adminToken)
+	log.Printf("Serving frontend from %s", webSource)
+	server.MountStatic(app, webFS, adminToken)
 
 	log.Printf("TimeNotes Blog server config=%s addr=%s db=%s notes=%s", cfg.ConfigPath, cfg.Addr, cfg.DBPath, cfg.NotesDir)
 	// Full admin URL only on stdout for operators; avoid repeating full token in rotated log files if multi-writer includes file.
@@ -178,17 +185,37 @@ func main() {
 	log.Println("blog server stopped")
 }
 
-const placeholderHTML = `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"/><title>TimeNotes Blog</title>
-<style>body{font-family:system-ui;background:#0f1115;color:#e8e6e3;display:grid;place-items:center;min-height:100vh;margin:0}
-.card{padding:2rem 2.5rem;border-radius:16px;background:rgba(255,255,255,.06);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.12)}
-code{color:#9cdcfe}</style></head>
-<body><div class="card"><h1>TimeNotes Blog</h1>
-<p>后端已启动。请构建前端：</p>
-<pre>cd frontend && npm install && npm run build</pre>
-<p>产物输出到 <code>web/</code> 后刷新本页。</p>
-<p><a href="/healthz" style="color:#7dd3fc">/healthz</a></p>
-</div></body></html>`
+// openWebFS returns the frontend asset filesystem.
+// Prefer on-disk web/ when it looks like a real Vite build (has assets/), so
+// local frontend rebuilds can be tested without recompiling Go. Otherwise use
+// the assets embedded at compile time — this is the production path and does
+// not depend on the process working directory.
+func openWebFS() (fs.FS, string, error) {
+	diskIndex := filepath.Join("web", "index.html")
+	diskAssets := filepath.Join("web", "assets")
+	if st, err := os.Stat(diskIndex); err == nil && st.Size() > 0 {
+		if ast, err := os.Stat(diskAssets); err == nil && ast.IsDir() {
+			// Reject the old placeholder page that only asked to build frontend.
+			raw, readErr := os.ReadFile(diskIndex)
+			if readErr == nil && !strings.Contains(string(raw), "请构建前端") {
+				return os.DirFS("web"), "disk:web/", nil
+			}
+		}
+	}
+
+	sub, err := fs.Sub(embeddedWeb, "web")
+	if err != nil {
+		return nil, "", fmt.Errorf("embed web/: %w (run: cd frontend && npm run build)", err)
+	}
+	if _, err := fs.Stat(sub, "index.html"); err != nil {
+		return nil, "", fmt.Errorf("embedded web/index.html missing (run: cd frontend && npm run build): %w", err)
+	}
+	// Require a real Vite build inside the binary (not a bare placeholder).
+	if entries, err := fs.ReadDir(sub, "assets"); err != nil || len(entries) == 0 {
+		return nil, "", fmt.Errorf("embedded web/assets missing or empty; run: cd frontend && npm run build")
+	}
+	return sub, "embed:web/", nil
+}
 
 func configureLogging(logPath string, maxBytes int64) (*os.File, error) {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)

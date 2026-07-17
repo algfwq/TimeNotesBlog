@@ -8,11 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -2499,40 +2502,54 @@ func (h *Hub) handleSiteBackground(c fiber.Ctx) error {
 	return c.SendFile(st.BackgroundPath)
 }
 
-// MountStatic serves SPA for public and admin paths.
+// MountStatic serves SPA for public and admin paths from an fs.FS
+// (typically go:embed of web/, optionally overridden by on-disk web/ for dev).
 // Important: do NOT redirect between /admin/{token} and /admin/{token}/.
 // Fiber's trailing-slash normalization would otherwise create ERR_TOO_MANY_REDIRECTS.
-func MountStatic(app *fiber.App, webDir, adminToken string) {
-	absWeb, err := filepath.Abs(webDir)
-	if err != nil {
-		absWeb = webDir
-	}
-	index := filepath.Join(absWeb, "index.html")
+func MountStatic(app *fiber.App, webFS fs.FS, adminToken string) {
 	adminPrefix := "/admin/" + adminToken
+
+	serveFile := func(c fiber.Ctx, name string) error {
+		data, err := fs.ReadFile(webFS, name)
+		if err != nil {
+			return err
+		}
+		if ct := contentTypeForPath(name); ct != "" {
+			c.Set("Content-Type", ct)
+		}
+		if name != "index.html" {
+			// Hashed Vite assets are immutable; HTML stays revalidatable.
+			c.Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			c.Set("Cache-Control", "no-cache")
+		}
+		return c.Send(data)
+	}
 
 	serveSPA := func(c fiber.Ctx, rel string) error {
 		rel = strings.TrimPrefix(rel, "/")
 		if rel == "" || rel == "." {
-			return c.SendFile(index)
+			return serveFile(c, "index.html")
 		}
-		// Prevent path traversal while resolving assets under web/.
-		candidate := filepath.Join(absWeb, filepath.Clean("/"+rel))
-		if !strings.HasPrefix(candidate, absWeb+string(os.PathSeparator)) && candidate != absWeb {
-			return c.SendFile(index)
+		// Normalize and reject path traversal. path.Clean keeps forward slashes for fs.FS.
+		cleaned := path.Clean("/" + rel)
+		cleaned = strings.TrimPrefix(cleaned, "/")
+		if cleaned == "" || cleaned == "." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") {
+			return serveFile(c, "index.html")
 		}
-		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
-			return c.SendFile(candidate)
+		if st, err := fs.Stat(webFS, cleaned); err == nil && !st.IsDir() {
+			return serveFile(c, cleaned)
 		}
-		return c.SendFile(index)
+		return serveFile(c, "index.html")
 	}
 
 	adminHandler := func(c fiber.Ctx) error {
-		path := c.Path()
+		reqPath := c.Path()
 		// Accept both /admin/{token} and /admin/{token}/... without redirects.
-		if path != adminPrefix && !strings.HasPrefix(path, adminPrefix+"/") {
+		if reqPath != adminPrefix && !strings.HasPrefix(reqPath, adminPrefix+"/") {
 			return c.Status(http.StatusNotFound).SendString("invalid admin path")
 		}
-		rel := strings.TrimPrefix(path, adminPrefix)
+		rel := strings.TrimPrefix(reqPath, adminPrefix)
 		return serveSPA(c, rel)
 	}
 
@@ -2541,13 +2558,37 @@ func MountStatic(app *fiber.App, webDir, adminToken string) {
 	app.Get(adminPrefix+"/*", adminHandler)
 
 	app.Get("/*", func(c fiber.Ctx) error {
-		path := c.Path()
-		if strings.HasPrefix(path, "/ws") || strings.HasPrefix(path, "/files/") || strings.HasPrefix(path, "/covers/") || strings.HasPrefix(path, "/site/") || strings.HasPrefix(path, "/api/") || path == "/healthz" {
+		reqPath := c.Path()
+		if strings.HasPrefix(reqPath, "/ws") || strings.HasPrefix(reqPath, "/files/") || strings.HasPrefix(reqPath, "/covers/") || strings.HasPrefix(reqPath, "/site/") || strings.HasPrefix(reqPath, "/api/") || reqPath == "/healthz" {
 			return fiber.ErrNotFound
 		}
-		if strings.HasPrefix(path, "/admin/") {
+		if strings.HasPrefix(reqPath, "/admin/") {
 			return c.Status(http.StatusNotFound).SendString("invalid admin path")
 		}
-		return serveSPA(c, path)
+		return serveSPA(c, reqPath)
 	})
+}
+
+func contentTypeForPath(name string) string {
+	ext := path.Ext(name)
+	if ext == "" {
+		return ""
+	}
+	if ct := mime.TypeByExtension(ext); ct != "" {
+		return ct
+	}
+	switch strings.ToLower(ext) {
+	case ".js", ".mjs":
+		return "text/javascript; charset=utf-8"
+	case ".css":
+		return "text/css; charset=utf-8"
+	case ".svg":
+		return "image/svg+xml"
+	case ".wasm":
+		return "application/wasm"
+	case ".map":
+		return "application/json"
+	default:
+		return ""
+	}
 }
