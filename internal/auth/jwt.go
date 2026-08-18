@@ -99,12 +99,13 @@ func EnsureSecret(secret string) string {
 }
 
 // IsWeakJWTSecret reports secrets that must not ship to production.
+// HS256 的安全下限是 32 字节（与摘要等长），低于该长度视为弱密钥。
 func IsWeakJWTSecret(secret string) bool {
 	s := strings.TrimSpace(secret)
 	if s == "" {
 		return true
 	}
-	if len(s) < 16 {
+	if len(s) < 32 {
 		return true
 	}
 	switch strings.ToLower(s) {

@@ -66,11 +66,27 @@ func main() {
 			}
 			log.Printf("WARNING: weak jwtSecret allowed via TIMENOTES_BLOG_ALLOW_WEAK_JWT=1 (dev only)")
 		} else {
-			log.Fatalf("jwtSecret is missing or too weak (min 16 chars, not a placeholder). Set jwtSecret in config or TIMENOTES_BLOG_JWT_SECRET. For local dev only: TIMENOTES_BLOG_ALLOW_WEAK_JWT=1")
+			log.Fatalf("jwtSecret is missing or too weak (min 32 chars, not a placeholder). Set jwtSecret in config or TIMENOTES_BLOG_JWT_SECRET. For local dev only: TIMENOTES_BLOG_ALLOW_WEAK_JWT=1")
 		}
 	}
+	// 内置默认 ipHashPepper 全网公开：公网部署继续用它等于把访客 IP 哈希变成可离线彩虹表反查的值。
+	if cfg.IPHashPepper == "timenotes-blog-ip" && !addrIsLoopbackHost(cfg.Addr) {
+		log.Printf("WARNING: ipHashPepper uses the built-in default on a non-loopback address; set a random ipHashPepper in config to keep visitor hashes unforgeable")
+	}
 
-	adminHash, err := auth.HashPassword("123456", cfg.PasswordPepper)
+	// 默认凭据治理：loopback 开发环境保留 admin/123456 便于首次体验；
+	// 非 loopback 部署改用随机一次性密码，只打印到 stdout，避免公网上任何人用源码里的默认值完成凭据迁移。
+	defaultPassword := "123456"
+	defaultPasswordGenerated := false
+	if !addrIsLoopbackHost(cfg.Addr) {
+		raw := make([]byte, 12)
+		if _, err := rand.Read(raw); err != nil {
+			log.Fatalf("generate admin password entropy: %v", err)
+		}
+		defaultPassword = hex.EncodeToString(raw)
+		defaultPasswordGenerated = true
+	}
+	adminHash, err := auth.HashPassword(defaultPassword, cfg.PasswordPepper)
 	if err != nil {
 		log.Fatalf("hash default admin password: %v", err)
 	}
@@ -123,6 +139,7 @@ func main() {
 		AllowMethods:     []string{fiber.MethodGet, fiber.MethodPost, fiber.MethodOptions, fiber.MethodHead},
 		AllowHeaders:     []string{"Content-Type", "Upgrade", "Connection", "Authorization", "X-Admin-Token"},
 	}))
+	app.Use(securityHeadersMiddleware)
 
 	hub := server.NewHub(store, geoProvider, server.Options{
 		Addr:                     cfg.Addr,
@@ -161,8 +178,13 @@ func main() {
 	fmt.Fprintf(os.Stdout, "Admin UI: http://%s/admin/%s/\n", displayHost(cfg.Addr), adminToken)
 	log.Printf("Admin UI path token prefix=%s (full URL printed once on stdout)", adminTokenShort)
 	if created {
-		fmt.Fprintln(os.Stdout, "Default admin account created: username=admin password=123456 (change immediately)")
-		log.Printf("Default admin account created (change credentials immediately; password not written to log file)")
+		if defaultPasswordGenerated {
+			fmt.Fprintf(os.Stdout, "Default admin account created: username=admin password=%s (random, shown once; change immediately)\n", defaultPassword)
+			log.Printf("Default admin account created with random one-time password (printed once on stdout)")
+		} else {
+			fmt.Fprintln(os.Stdout, "Default admin account created: username=admin password=123456 (change immediately)")
+			log.Printf("Default admin account created (change credentials immediately; password not written to log file)")
+		}
 	} else {
 		log.Printf("Admin account already exists in database (default password only applies on first start)")
 	}
@@ -274,4 +296,43 @@ func displayHost(addr string) string {
 		return "127.0.0.1" + addr
 	}
 	return addr
+}
+
+// addrIsLoopbackHost 判断监听地址是否仅限本机；空 host 视为全网卡（非 loopback）。
+func addrIsLoopbackHost(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// securityHeadersMiddleware 给所有响应补基础安全头。
+// CSP 允许 style inline（Tailwind/Semi 运行时注入）、blob:/data: 媒体（阅读器渲染）；
+// script 的 unsafe-eval 是 VChart 统计图与 setImmediate polyfill 用 new Function 构造访问器所需，
+// 外部脚本加载仍被禁止——这是把 XSS 影响压制在"无法加载外部脚本"的关键一层。
+func securityHeadersMiddleware(c fiber.Ctx) error {
+	c.Set("Content-Security-Policy",
+		"default-src 'self'; "+
+			"script-src 'self' 'unsafe-eval'; "+
+			"style-src 'self' 'unsafe-inline'; "+
+			"img-src 'self' data: blob:; "+
+			"media-src 'self' data: blob:; "+
+			"font-src 'self' data:; "+
+			"connect-src 'self' ws: wss:; "+
+			"frame-ancestors 'none'; "+
+			"base-uri 'self'; "+
+			"form-action 'self'")
+	c.Set("X-Frame-Options", "DENY")
+	c.Set("Referrer-Policy", "no-referrer")
+	c.Set("X-Content-Type-Options", "nosniff")
+	return c.Next()
 }

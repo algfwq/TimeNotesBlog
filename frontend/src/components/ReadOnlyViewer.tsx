@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
+import DOMPurify from 'dompurify';
 import { Button, Slider, Typography } from '@douyinfe/semi-ui';
 import {
   IconArrowLeft,
@@ -25,6 +26,16 @@ const SPINE_WIDTH = 40;
 const ZOOM_MIN = 0.25;
 const ZOOM_MAX = 2.4;
 const FLIP_DURATION = 680;
+
+// 笔记富文本来自上传的 .tnote 包，注入前必须过白名单；img 的 src 仅放行 data:，防止外链信标。
+function sanitizeRichTextContent(content?: string) {
+  if (!content) {
+    return '';
+  }
+  return DOMPurify.sanitize(content, {
+    ALLOWED_URI_REGEXP: /^(?:data:image\/|mailto:|tel:|https?:)/i,
+  });
+}
 
 interface SpreadPages {
   left: NotePage | null;
@@ -743,7 +754,7 @@ function ReadOnlyElement({
         onPointerDownCapture={handleLinkPointerDown}
         onClickCapture={handleLinkClick}
         onWheel={(event) => event.stopPropagation()}
-        dangerouslySetInnerHTML={{ __html: element.content ?? '' }}
+        dangerouslySetInnerHTML={{ __html: sanitizeRichTextContent(element.content) }}
       />
     );
   }

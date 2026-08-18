@@ -8,7 +8,7 @@ TimeNotes 手账本的公开展示与协作上传服务。
 - **业务 API**：几乎全部走 WebSocket；HTTP 仅用于静态页、健康检查、`.tnote` 下载
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-2.9.0-blue?style=flat-square" />
+  <img alt="Version" src="https://img.shields.io/badge/version-3.0.0-blue?style=flat-square" />
   <img alt="Go" src="https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square" />
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20amd64-5B8DEF?style=flat-square" />
 </p>
@@ -30,10 +30,10 @@ TimeNotes 手账本的公开展示与协作上传服务。
   👉 <a href="https://ifdian.net/a/algfwq"><strong>前往爱发电支持 TimeNotes</strong></a>
 </p>
 
-## 版本 2.9.0 更新摘要
+## 版本 3.0.0 更新摘要
 
-- 生产构建产物统一命名：`TimeNotesBlog-2.9.0-{arch}-{os}`（`//go:embed` 内嵌当前 `web/` 前端构建；单独拷贝 exe 即可部署）。
-- 与客户端 2.9.0 对齐：桌面 / Android 均可「连接到 Blog」上传或更新完整 `.tnote`。
+- 生产构建产物统一命名：`TimeNotesBlog-3.0.0-{arch}-{os}`（`//go:embed` 内嵌当前 `web/` 前端构建；单独拷贝 exe 即可部署）。
+- 与客户端 3.0.0 对齐：桌面 / Android 均可「连接到 Blog」上传或更新完整 `.tnote`。
 - 客户端 Android 侧通过原生 Go 代理发起 Blog WebSocket，避免 `https://wails.localhost` 混合内容拦截。
 - 账号体系：管理员后台发号、argon2id 密码、PoW 登录、JWT 会话；后台路径 token 每次启动随机。
 - 互动：按 IP 点赞、评论、访问统计与可插拔 GeoIP。
@@ -51,14 +51,14 @@ TimeNotes 手账本的公开展示与协作上传服务。
 
 ---
 
-## 发布产物（v2.9.0）
+## 发布产物（v3.0.0）
 
 位于 `bin/`，命名规则：`TimeNotesBlog-{version}-{arch}-{os}`。
 
 | 文件 | 说明 |
 |------|------|
-| `bin/TimeNotesBlog-2.9.0-amd64-windows.exe` | Windows amd64 生产可执行文件（**已内嵌**前端静态资源） |
-| `bin/TimeNotesBlog-2.9.0-amd64-linux` | Linux amd64 生产可执行文件（**已内嵌**前端静态资源） |
+| `bin/TimeNotesBlog-3.0.0-amd64-windows.exe` | Windows amd64 生产可执行文件（**已内嵌**前端静态资源） |
+| `bin/TimeNotesBlog-3.0.0-amd64-linux` | Linux amd64 生产可执行文件（**已内嵌**前端静态资源） |
 
 **前端已在编译时通过 `//go:embed` 打进二进制**，部署时**不必**再拷贝 `web/` 目录，也**不必**在目标机器安装 Go / Node.js。
 
@@ -74,7 +74,7 @@ TimeNotes 手账本的公开展示与协作上传服务。
 
 | 文件 | 是否必须 | 说明 |
 |------|----------|------|
-| `TimeNotesBlog-2.9.0-amd64-windows.exe` 或 `TimeNotesBlog-2.9.0-amd64-linux` | **必须** | 预构建可执行文件 |
+| `TimeNotesBlog-3.0.0-amd64-windows.exe` 或 `TimeNotesBlog-3.0.0-amd64-linux` | **必须** | 预构建可执行文件 |
 | `config.json` | **必须** | 由仓库中的 `config.example.json` 复制并修改 |
 
 **不需要**随包拷贝：
@@ -136,15 +136,15 @@ Copy-Item config.example.json config.json
 
 ```powershell
 cd D:\path\to\blog   # 与 exe、config.json 同一目录
-.\TimeNotesBlog-2.9.0-amd64-windows.exe
+.\TimeNotesBlog-3.0.0-amd64-windows.exe
 ```
 
 **Linux：**
 
 ```bash
 cd /opt/timenotes-blog   # 与二进制、config.json 同一目录
-chmod +x TimeNotesBlog-2.9.0-amd64-linux
-./TimeNotesBlog-2.9.0-amd64-linux
+chmod +x TimeNotesBlog-3.0.0-amd64-linux
+./TimeNotesBlog-3.0.0-amd64-linux
 ```
 
 成功时启动日志会出现类似：
@@ -152,7 +152,8 @@ chmod +x TimeNotesBlog-2.9.0-amd64-linux
 ```
 Serving frontend from embed:web/
 Admin UI: http://127.0.0.1:8090/admin/<随机token>/
-Default admin account created: username=admin password=123456
+Default admin account created: username=admin password=123456        ← 仅 loopback 监听
+Default admin account created: username=admin password=<随机24位hex> ← 非 loopback 监听（随机密码只打印这一次）
 ```
 
 含义：
@@ -162,7 +163,7 @@ Default admin account created: username=admin password=123456
 | `Serving frontend from embed:web/` | 正在使用二进制内嵌前端（正常生产路径） |
 | `Serving frontend from disk:web/` | 工作目录下存在完整 `web/assets/`，优先用磁盘前端（开发迭代时常见，预构建部署一般不会出现） |
 | `Admin UI: ...` | **每次重启 token 都会变**，请从本次启动的 stdout 复制完整 URL |
-| 默认管理员 | 仅**第一次**建库时创建：`admin` / `123456`，登录后台后立刻改密 |
+| 默认管理员 | 仅**第一次**建库时创建。loopback（本机开发）：`admin` / `123456`；非 loopback（公网/局域网部署）：随机密码，只在 stdout 打印一次，登录后台后立刻改密。以服务方式启动看不到 stdout 时，用 `tools/resetpw` 交互式重置 |
 
 浏览器访问 `http://<主机>:<端口>/` 应看到 Blog 首页，而不是「请构建前端」提示页。
 
@@ -213,11 +214,11 @@ cd ..
 # 2) 再打包二进制（会把当前 web/ 通过 go:embed 打进 exe）
 # Windows amd64
 $env:CGO_ENABLED=0; $env:GOOS="windows"; $env:GOARCH="amd64"
-go build -trimpath -ldflags="-s -w" -o bin/TimeNotesBlog-2.9.0-amd64-windows.exe .
+go build -trimpath -ldflags="-s -w" -o bin/TimeNotesBlog-3.0.0-amd64-windows.exe .
 
 # Linux amd64
 $env:CGO_ENABLED=0; $env:GOOS="linux"; $env:GOARCH="amd64"
-go build -trimpath -ldflags="-s -w" -o bin/TimeNotesBlog-2.9.0-amd64-linux .
+go build -trimpath -ldflags="-s -w" -o bin/TimeNotesBlog-3.0.0-amd64-linux .
 ```
 
 **顺序必须是：先 `npm run build`，再 `go build`。** 若 `web/` 缺少 `index.html` 或 `assets/`，编译会失败或产物无法正确提供页面。
@@ -271,7 +272,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/timenotes-blog
-ExecStart=/opt/timenotes-blog/TimeNotesBlog-2.9.0-amd64-linux
+ExecStart=/opt/timenotes-blog/TimeNotesBlog-3.0.0-amd64-linux
 Restart=on-failure
 # 可选：Environment=TIMENOTES_BLOG_CONFIG=/opt/timenotes-blog/config.json
 
@@ -283,7 +284,7 @@ WantedBy=multi-user.target
 
 ## 安全说明
 
-1. **默认管理员** `admin` / `123456` 仅首次初始化；务必修改。
+1. **默认管理员**仅首次初始化；务必修改。loopback 监听为 `admin` / `123456`；非 loopback 首启用随机密码（只打印 stdout 一次）。
 2. **后台路径 token 每次重启都会变**，请从启动日志复制。
 3. 密码使用 **argon2id** 哈希存储。
 4. 登录需要 **PoW**；同一 IP 失败次数越多难度越高。上传等已登录操作使用 **JWT**，不再做 PoW。
@@ -291,7 +292,7 @@ WantedBy=multi-user.target
 6. 评论支持「昵称+邮箱」或 GitHub 主页链接；GitHub 头像仅解析 `github.com/{user}`，不服务端抓任意 URL。
 7. 上传文件名经路径净化；磁盘以 UUID 文件名存储。
 8. 日志不记录密码、JWT、PoW 答案；Geo 失败时日志只写 IP 哈希前缀。
-9. 生产必须设置强 `jwtSecret`。
+9. 生产必须设置强 `jwtSecret`（**v3.0.0 起下限为 32 字符**，16–31 字符会拒绝启动）。
 
 ---
 
@@ -351,8 +352,8 @@ TimeNotesBlog/
 ├── frontend/           # React 源码（仅源码构建需要）
 ├── web/                # 前端构建产物；go build 时 embed 进二进制
 ├── bin/                # 预构建发布产物
-│   ├── TimeNotesBlog-2.9.0-amd64-windows.exe
-│   └── TimeNotesBlog-2.9.0-amd64-linux
+│   ├── TimeNotesBlog-3.0.0-amd64-windows.exe
+│   └── TimeNotesBlog-3.0.0-amd64-linux
 ├── internal/
 │   ├── auth/           # 密码、JWT、PoW
 │   ├── protocol/       # WS 信封
@@ -402,7 +403,7 @@ npm run build
 ## 常见问题
 
 **Q: 打开首页提示「请构建前端」？**  
-A: 旧版二进制未内嵌前端，或工作目录里有一份损坏/占位的 `web/index.html`。请改用 v2.9.0 预构建产物（日志应出现 `Serving frontend from embed:web/`），并删除错误的占位 `web/` 目录后重启。
+A: 旧版二进制未内嵌前端，或工作目录里有一份损坏/占位的 `web/index.html`。请改用 v3.0.0 预构建产物（日志应出现 `Serving frontend from embed:web/`），并删除错误的占位 `web/` 目录后重启。
 
 **Q: 只要 exe 能不能跑？还要不要 `web/`？**  
 A: 预构建产物已内嵌前端，**只需 exe + `config.json`**。`web/`、Go、Node 都不是部署依赖。
@@ -424,3 +425,31 @@ A: 检查 `addr` 是否绑定 `0.0.0.0`，以及系统防火墙 / 云安全组�
 
 **Q: 启动直接退出，提示 jwtSecret 太弱？**  
 A: 生产必须在 `config.json` 设置足够长的 `jwtSecret`。仅本地调试可设环境变量 `TIMENOTES_BLOG_ALLOW_WEAK_JWT=1`（不要用于公网）。
+
+## 安全说明
+
+- **可见笔记的完整包是公开可读的**：`PublicDownload=false` 只是隐藏前台下载按钮；阅读器渲染需要 `notes.get` 签发的短期 `read` token 拉取完整 `.tnote`，任何匿名访客同样可以获得。不要把含私密内容的笔记设为可见。
+- **公网部署必须做的事**：设置强随机 `jwtSecret`（≥32 字符）与 `ipHashPepper`、配置精确 `corsOrigins`、关闭 `allowLoopbackOrigins`、首次启动后立即完成后台凭据迁移（非 loopback 首启的默认密码是随机值，只在 stdout 打印一次）。
+- 响应已默认带 CSP / X-Frame-Options / nosniff / Referrer-Policy 安全头；`/stats` 类信息端点不开放。
+- **GeoIP 默认源为 [ipwho.is](https://ipwho.is)**：HTTPS、免 API key、免费 1000 次/天/出口 IP（配合 168 小时缓存足够个人博客使用）。超出限额时地理信息留空但不影响访问统计；需要更高配额可申请 ip-api 等付费源并在 `config.json` 的 `geo` 段替换 `urlTemplate` 与字段映射。
+
+## v3.0.0 安全加固：对使用者可见的行为变化
+
+**访客侧（基本无感）：**
+
+- 笔记富文本渲染前经白名单过滤（`dompurify`）：正常样式、字体、加粗斜体、行内图片不受影响；笔记中的外部 http 图片链接不再被浏览器自动加载（素材必须打包进 `.tnote`，这也是客户端导出的默认行为）。
+- 页面响应新增 CSP 等安全头：外部 CDN 脚本/样式会被浏览器拦截（内置前端不引用任何外部资源，仅影响自行改造过的页面）；`script-src` 含 `'unsafe-eval'`，这是统计页 VChart 图表库运行时构造访问器所需，外部脚本加载仍被禁止。
+
+**管理员侧（需要注意）：**
+
+- **登录态不再跨浏览器会话保留**：管理后台 token 从 localStorage 改为 sessionStorage，关闭标签页/浏览器即登出，下次访问需重新登录。这是把"24 小时免登录"换成"XSS 无法持久窃取凭证"的取舍。
+- **公网/局域网部署的首次密码是随机值**：非 loopback 地址首启不再使用 `admin/123456`，随机密码只在启动 stdout 打印一次。以 systemd/计划任务等方式后台启动时请通过日志重定向或终端获取；错过就只能用 `tools/resetpw` 重置。
+- **`tools/resetpw` 改为交互式**：在终端中输入两次新密码（不再固定重置为 `123456`），且重置后的账号会在下次登录时强制走凭据迁移；同时会读取 `config.json` 的 `passwordPepper` 保证哈希口径一致。无法再用于自动化脚本。
+- **jwtSecret 下限 16 → 32 字符**：存量部署若配置了 16–31 字符的 secret，升级后会拒绝启动，需重新生成（`openssl rand -hex 32`）。本地开发不受影响。
+- 内置默认 `ipHashPepper` 在非 loopback 部署时启动会打印警告：默认值全网公开，访客 IP 哈希存在被离线彩虹表反查的可能，建议配置随机值。
+
+**运维侧：**
+
+- 访客 UA/路径等统计字段写入前截断（512/64/256 字符），统计页面展示不受影响，仅极端超长输入被裁剪。
+- GeoIP 查询默认走 HTTPS（见上文 ipwho.is），访客 IP 不再明文发给第三方。
+- 历史日志中泄露的完整后台 URL 已在升级时打码；完整 URL 现在只在 stdout 出现一次，不会写入轮转日志文件。

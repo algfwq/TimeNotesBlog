@@ -41,20 +41,22 @@ func NewProvider(cfg Config) Provider {
 		cfg.CountryField = "country"
 	}
 	if cfg.RegionField == "" {
-		cfg.RegionField = "regionName"
+		cfg.RegionField = "region"
 	}
 	if cfg.CityField == "" {
 		cfg.CityField = "city"
 	}
 	if cfg.LatField == "" {
-		cfg.LatField = "lat"
+		cfg.LatField = "latitude"
 	}
 	if cfg.LngField == "" {
-		cfg.LngField = "lon"
+		cfg.LngField = "longitude"
 	}
 	if cfg.URLTemplate == "" {
-		cfg.URLTemplate = "http://ip-api.com/json/{ip}?fields=status,message,country,regionName,city,lat,lon,query"
-		cfg.Provider = "ip-api"
+		// 默认 ipwho.is：免 API key、原生 HTTPS（访客 IP 不明文出网）、免费 1000 次/天/出口 IP，
+		// 字段名与下方默认 field 配置直接对齐。ip-api 付费版可改回其 https 模板并填 {apiKey}。
+		cfg.URLTemplate = "https://ipwho.is/{ip}"
+		cfg.Provider = "ipwhois"
 	}
 	return &HTTPProvider{
 		cfg: cfg,
@@ -95,6 +97,11 @@ func (p *HTTPProvider) Lookup(ctx context.Context, ip string) (storage.GeoInfo, 
 		return storage.GeoInfo{}, err
 	}
 	if status, ok := raw["status"].(string); ok && status == "fail" {
+		msg, _ := raw["message"].(string)
+		return storage.GeoInfo{}, fmt.Errorf("geo fail: %s", msg)
+	}
+	// ipwho.is 用 success:false 表示查询失败（保留 IP、限流等），失败时不落缓存。
+	if success, ok := raw["success"].(bool); ok && !success {
 		msg, _ := raw["message"].(string)
 		return storage.GeoInfo{}, fmt.Errorf("geo fail: %s", msg)
 	}

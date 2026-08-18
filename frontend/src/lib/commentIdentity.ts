@@ -53,9 +53,12 @@ export function writeCommentIdentity(identity: CommentIdentity) {
     email: identity.email.trim(),
     githubUrl: identity.githubUrl.trim(),
   }));
-  document.cookie = `${COOKIE_NAME}=${payload}; Path=/; Max-Age=${ONE_YEAR_SECONDS}; SameSite=Lax`;
+  // https 下补 Secure，防止昵称/邮箱经明文信道泄露；http 本地开发不加（加了写不进去）。
+  const secure = window.location.protocol === 'https:' ? '; Secure' : '';
+  document.cookie = `${COOKIE_NAME}=${payload}; Path=/; Max-Age=${ONE_YEAR_SECONDS}; SameSite=Lax${secure}`;
 }
 
 export function clearCommentIdentity() {
-  document.cookie = `${COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax`;
+  const secure = window.location.protocol === 'https:' ? '; Secure' : '';
+  document.cookie = `${COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax${secure}`;
 }

@@ -19,15 +19,15 @@
   "maxLoginPerIPPerMinute": 20,
   "maxCommentPerIPPerMinute": 30,
   "geo": {
-    "provider": "ip-api",
-    "urlTemplate": "http://ip-api.com/json/{ip}?fields=status,message,country,regionName,city,lat,lon,query",
+    "provider": "ipwhois",
+    "urlTemplate": "https://ipwho.is/{ip}",
     "apiKey": "",
     "timeoutMs": 3000,
     "cacheTTLHours": 168,
     "countryField": "country",
-    "regionField": "regionName",
+    "regionField": "region",
     "cityField": "city",
-    "latField": "lat",
-    "lngField": "lon"
+    "latField": "latitude",
+    "lngField": "longitude"
   }
 }

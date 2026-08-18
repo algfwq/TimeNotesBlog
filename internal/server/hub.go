@@ -866,6 +866,18 @@ func safeFilename(name string) string {
 	return name
 }
 
+// truncateRunes 按字符数截断访客可控字段，防止匿名 visit 请求无限撑大数据库行。
+func truncateRunes(value string, max int) string {
+	if max <= 0 || len(value) <= max {
+		return value
+	}
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return string(runes[:max])
+}
+
 func (cs *clientSession) handleUploadStart(ctx context.Context, env protocol.Envelope, isUpdate, forceAdmin bool) {
 	dbUser, err := cs.requireCurrentUser(ctx)
 	if err != nil {
@@ -1422,9 +1434,9 @@ func (cs *clientSession) handleVisit(ctx context.Context, env protocol.Envelope)
 	v := storage.Visit{
 		ID:        protocol.NewID(),
 		IPHash:    cs.ipHash,
-		Path:      strings.TrimSpace(req.Path),
-		NoteID:    strings.TrimSpace(req.NoteID),
-		UserAgent: strings.TrimSpace(req.UserAgent),
+		Path:      truncateRunes(strings.TrimSpace(req.Path), 512),
+		NoteID:    truncateRunes(strings.TrimSpace(req.NoteID), 64),
+		UserAgent: truncateRunes(strings.TrimSpace(req.UserAgent), 256),
 		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 if info, err := cs.hub.store.GetGeoCache(ctx, cs.ipHash, cs.hub.opts.GeoCacheTTL); err == nil && info != nil {

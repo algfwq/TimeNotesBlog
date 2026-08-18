@@ -50,6 +50,7 @@ type Stats = {
 };
 
 const TOKEN_KEY = 'tn_blog_admin_token';
+// token 放 sessionStorage：XSS 无法持久窃取，浏览器会话结束即失效。
 
 const NAV_ITEMS: Array<{ key: string; label: string; desc: string; icon: ReactNode }> = [
   { key: 'dash', label: '仪表盘', desc: '访问趋势、地图与互动概览', icon: <IconHistogram /> },
@@ -75,7 +76,7 @@ export function AdminApp() {
   const isDark = mode === 'dark';
   const colors = chartColors(isDark);
 
-  const [token, setToken] = useState(localStorage.getItem(TOKEN_KEY) || '');
+  const [token, setToken] = useState(sessionStorage.getItem(TOKEN_KEY) || '');
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
   const [authed, setAuthed] = useState(false);
@@ -122,7 +123,7 @@ export function AdminApp() {
 
   const applySession = (res: { token?: string; username: string; role: string; canUpload?: boolean; mustChangeCredentials?: boolean; userId?: string }) => {
     if (res.token) {
-      localStorage.setItem(TOKEN_KEY, res.token);
+      sessionStorage.setItem(TOKEN_KEY, res.token);
       setToken(res.token);
       blogWS.setToken(res.token);
     }
@@ -180,7 +181,7 @@ export function AdminApp() {
       applySession({ ...res, token });
       if (!res.mustChangeCredentials) await refreshAll();
     } catch {
-      localStorage.removeItem(TOKEN_KEY);
+      sessionStorage.removeItem(TOKEN_KEY);
       setToken('');
       setAuthed(false);
       setMustChange(false);
@@ -705,7 +706,7 @@ export function AdminApp() {
               theme="borderless"
               icon={<IconExit />}
               onClick={() => {
-                localStorage.removeItem(TOKEN_KEY);
+                sessionStorage.removeItem(TOKEN_KEY);
                 setAuthed(false);
                 setToken('');
                 blogWS.setToken('');

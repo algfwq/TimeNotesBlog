@@ -100,15 +100,16 @@ func defaultConfig() AppConfig {
 		VisitRetentionDays:       90,
 		ReadDeadline:             60 * time.Second,
 		Geo: GeoConfig{
-			Provider:      "ip-api",
-			URLTemplate:   "http://ip-api.com/json/{ip}?fields=status,message,country,regionName,city,lat,lon,query",
+			// ipwho.is：免 key、HTTPS、免费 1000 次/天/出口 IP，字段名与响应直接对齐。
+			Provider:      "ipwhois",
+			URLTemplate:   "https://ipwho.is/{ip}",
 			TimeoutMs:     3000,
 			CacheTTLHours: 168,
 			CountryField:  "country",
-			RegionField:   "regionName",
+			RegionField:   "region",
 			CityField:     "city",
-			LatField:      "lat",
-			LngField:      "lon",
+			LatField:      "latitude",
+			LngField:      "longitude",
 		},
 	}
 }
@@ -144,7 +145,7 @@ func applyEnvOverrides(cfg *AppConfig) {
 	}
 	if v := strings.TrimSpace(os.Getenv("TIMENOTES_BLOG_GEO_URL")); v != "" {
 		cfg.Geo.URLTemplate = v
-		if cfg.Geo.Provider == "" || cfg.Geo.Provider == "ip-api" {
+		if cfg.Geo.Provider == "" || cfg.Geo.Provider == "ip-api" || cfg.Geo.Provider == "ipwhois" {
 			cfg.Geo.Provider = "http_json"
 		}
 	}

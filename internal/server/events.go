@@ -57,6 +57,10 @@ func (e *eventHub) eligible(cs *clientSession, audience eventAudience) bool {
 	if cs == nil {
 		return false
 	}
+	// 只向显式 events.subscribe 过的会话推送，未订阅的连接不承担广播开销。
+	if !cs.eventsOn {
+		return false
+	}
 	switch audience {
 	case audiencePublic:
 		return true
