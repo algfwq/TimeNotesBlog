@@ -16,7 +16,10 @@ export function ThemeToggle({ size = 'default' }: { size?: 'default' | 'small' |
           {isDark ? <IconSun /> : <IconMoon />}
         </span>
       }
-      onClick={toggle}
+      onClick={(e) => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        toggle({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+      }}
       aria-label={isDark ? '切换到浅色' : '切换到深色'}
       title={isDark ? '浅色模式' : '深色模式'}
     />

@@ -207,6 +207,11 @@ export function HomePage() {
             style={{ objectPosition: focusPos }}
           />
         ) : null}
+        <div className="home-hero-aurora" aria-hidden>
+          <span />
+          <span />
+          <span />
+        </div>
         <div className="home-hero-overlay" style={{ background: overlay }} />
         <div className="home-hero-inner">
           <div className="home-hero-top">
@@ -250,14 +255,15 @@ export function HomePage() {
           </div>
         ) : (
           <div className="note-grid note-grid--manager">
-            {notes.map((note) => {
+            {notes.map((note, index) => {
               const src = coverSrc(note);
               const broken = !src || brokenCovers[note.id];
               return (
                 <button
                   key={note.id}
                   type="button"
-                  className="note-card glass-panel"
+                  className="note-card glass-panel note-card--enter"
+                  style={{ '--stagger-index': index } as React.CSSProperties}
                   onClick={() => openNote(note.id)}
                 >
                   <div className="note-cover">

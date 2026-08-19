@@ -20,6 +20,7 @@ import { VideoElement } from './elements/VideoElement';
 import { ModelElement } from './elements/ModelElement';
 import { CodeBlockPreview } from './elements/CodeBlockElement';
 import { FontFaceDefinitions } from './FontFaceDefinitions';
+import { ThemeToggle } from './ThemeToggle';
 
 const defaultInlineCodeFontFamily = '"Cascadia Code", "Fira Code", Consolas, "SFMono-Regular", monospace';
 const SPINE_WIDTH = 40;
@@ -442,6 +443,7 @@ export function ReadOnlyViewer({
                 下载
               </Button>
             ) : null}
+            <ThemeToggle />
           </div>
         </div>
       ) : (
