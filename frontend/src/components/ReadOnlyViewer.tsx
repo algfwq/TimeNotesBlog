@@ -21,6 +21,7 @@ import { ModelElement } from './elements/ModelElement';
 import { CodeBlockPreview } from './elements/CodeBlockElement';
 import { FontFaceDefinitions } from './FontFaceDefinitions';
 import { ThemeToggle } from './ThemeToggle';
+import { MediaErrorBoundary } from './MediaErrorBoundary';
 
 const defaultInlineCodeFontFamily = '"Cascadia Code", "Fira Code", Consolas, "SFMono-Regular", monospace';
 const SPINE_WIDTH = 40;
@@ -773,7 +774,9 @@ function ReadOnlyElement({
     const asset = mergeAssetWithCache(assets.find((item) => item.id === element.assetId));
     return (
       <div style={base}>
-        <AudioElement element={element} asset={asset} readOnly />
+        <MediaErrorBoundary>
+          <AudioElement element={element} asset={asset} readOnly />
+        </MediaErrorBoundary>
       </div>
     );
   }
@@ -782,7 +785,9 @@ function ReadOnlyElement({
     const asset = mergeAssetWithCache(assets.find((item) => item.id === element.assetId));
     return (
       <div style={base}>
-        <VideoElement element={element} asset={asset} readOnly />
+        <MediaErrorBoundary>
+          <VideoElement element={element} asset={asset} readOnly />
+        </MediaErrorBoundary>
       </div>
     );
   }
@@ -791,7 +796,9 @@ function ReadOnlyElement({
     const asset = mergeAssetWithCache(assets.find((item) => item.id === element.assetId));
     return (
       <div style={base}>
-        <ModelElement element={element} asset={asset} readOnly />
+        <MediaErrorBoundary>
+          <ModelElement element={element} asset={asset} readOnly />
+        </MediaErrorBoundary>
       </div>
     );
   }

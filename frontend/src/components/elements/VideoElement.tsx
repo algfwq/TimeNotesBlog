@@ -78,6 +78,7 @@ export function VideoElement({
         className={`timenotes-video-player timenotes-video-${theme}`}
         data-video-player
         onPointerDownCapture={stopInteractiveEvent}
+        onWheel={stopInteractiveEvent}
       >
         <VideoPlayer
           src={src}

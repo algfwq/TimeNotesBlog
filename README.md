@@ -165,7 +165,7 @@ Default admin account created: username=admin password=<随机24位hex> ← 非 
 | `Serving frontend from embed:web/` | 正在使用二进制内嵌前端（正常生产路径） |
 | `Serving frontend from disk:web/` | 工作目录下存在完整 `web/assets/`，优先用磁盘前端（开发迭代时常见，预构建部署一般不会出现） |
 | `Admin UI: ...` | **每次重启 token 都会变**，请从本次启动的 stdout 复制完整 URL |
-| 默认管理员 | 仅**第一次**建库时创建。loopback（本机开发）：`admin` / `123456`；非 loopback（公网/局域网部署）：随机密码，只在 stdout 打印一次，登录后台后立刻改密。以服务方式启动看不到 stdout 时，用 `tools/resetpw` 交互式重置 |
+| 默认管理员 | 仅**第一次**建库时创建。loopback（本机开发）：`admin` / `123456`；非 loopback（公网/局域网部署）：随机密码，只在 stdout 打印一次，登录后台后立刻改密。以服务方式启动看不到 stdout 时，用 `tools/resetpw` 交互式重置（见下文「管理员密码重置」一节） |
 
 浏览器访问 `http://<主机>:<端口>/` 应看到 Blog 首页，而不是「请构建前端」提示页。
 
@@ -192,6 +192,41 @@ sudo ufw reload
 3. 填写 Blog URL / 用户名 / 密码，可勾选「记住密码」
 4. 连接成功后，在手账卡片菜单「上传到 Blog」/「更新到 Blog」
 5. 上云手账会显示 Semi 云图标标签；本地删除不影响服务器副本
+
+### 6. 管理员密码重置
+
+适用场景：公网/局域网首启的随机密码只在 stdout 打印一次、错过了；或忘记了已有管理员密码。
+
+重置工具 `tools/resetpw` 是交互式命令行程序，**随源码仓库分发，不在 `bin/` 预构建产物中**，需要在有 Go 的机器上先构建再使用：
+
+```powershell
+# 1) 在源码仓库构建重置工具（Windows）
+cd TimeNotesBlog
+go build -o resetpw.exe ./tools/resetpw
+# Linux：go build -o resetpw ./tools/resetpw
+
+# 2) 拷到部署目录（与 data/blog.db、config.json 同级）运行
+cd D:\blog
+.\resetpw.exe -user admin
+```
+
+本地开发（服务端就跑在仓库目录）时更简单：
+
+```powershell
+cd TimeNotesBlog
+go run ./tools/resetpw -user admin
+```
+
+行为要点：
+
+| 项 | 说明 |
+|------|------|
+| `-user` | **必须显式指定**。默认值是开发者账号 `admin`；输出里 `updated=0` 表示用户名没匹配到（工具不会因此报错退出） |
+| 密码要求 | 终端输入两次、不回显；至少 8 位 |
+| 哈希口径 | 读取**当前目录** `config.json` 的 `passwordPepper`（或 `-config` 指定路径）。必须与服务器实际使用的配置一致，否则重置后依然无法登录 |
+| 数据库定位 | 只在 `./data/blog.db` 和 `../../data/blog.db` 两处查找；`dbPath` 改过路径的部署，请在能看到正确 `data/blog.db` 的目录运行 |
+| 重置后 | 账号被标记「必须迁移凭据」：下次登录会被强制要求完成凭据迁移，设置新凭据后才能继续使用后台 |
+| 多管理员 | 分别重置多次运行即可 |
 
 ---
 
@@ -362,6 +397,8 @@ TimeNotesBlog/
 │   ├── server/         # Fiber + Hub
 │   ├── storage/        # Store 接口 + sqlite
 │   └── geo/            # 可插拔 GeoIP
+├── tools/
+│   └── resetpw/        # 管理员密码交互式重置工具（源码分发，需 go build）
 ├── data/               # 运行时：数据库与 .tnote（可配置）
 └── logs/               # 运行时日志（可配置）
 ```
@@ -415,6 +452,9 @@ A: `config.json` 与相对路径的 `data/`、`logs/` 都相对**进程工作目
 
 **Q: 后台 404？**  
 A: token 每次重启变化，请看最新启动日志中的 `Admin UI:` 完整 URL。
+
+**Q: 忘记管理员密码 / 错过首启随机密码怎么办？**  
+A: 用 `tools/resetpw` 交互式重置，见部署章节的「管理员密码重置」。注意 `-user` 默认值不是 `admin`，必须显式传参。
 
 **Q: 后台「编辑」失败？**  
 A: 需本机先启动 TimeNotes 客户端；桥只监听 loopback。

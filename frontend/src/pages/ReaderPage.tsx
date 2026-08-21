@@ -4,6 +4,7 @@ import { Button, SideSheet, Spin, TextArea, Toast, Typography } from '@douyinfe/
 import { blogWS } from '../lib/wsClient';
 import { loadTNoteFromUrl, releaseTNoteObjectUrls, type LoadedTNote } from '../lib/tnote';
 import { ReaderView } from '../components/ReaderView';
+import { MediaErrorBoundary } from '../components/MediaErrorBoundary';
 import { CommentIdentityModal } from '../components/CommentIdentityModal';
 import { readCommentIdentity, writeCommentIdentity, type CommentIdentity } from '../lib/commentIdentity';
 
@@ -314,21 +315,29 @@ export function ReaderPage() {
   return (
     <div className="reader-page">
       {loaded?.document ? (
-        <ReaderView
-          document={loaded.document}
-          chrome={{
-            title,
-            ownerName: note?.ownerName,
-            liked,
-            likeCount: note?.likeCount ?? 0,
-            commentCount: note?.commentCount ?? 0,
-            canDownload,
-            onBack: () => navigate('/'),
-            onLike: () => void onLike(),
-            onComment: () => setSheetOpen(true),
-            onDownload: () => void onDownload(),
-          }}
-        />
+        <MediaErrorBoundary
+          fallback={
+            <div className="reader-page--state">
+              <div className="glass-panel" style={{ borderRadius: 16, padding: 24 }}>手账内容渲染失败，请刷新后重试</div>
+            </div>
+          }
+        >
+          <ReaderView
+            document={loaded.document}
+            chrome={{
+              title,
+              ownerName: note?.ownerName,
+              liked,
+              likeCount: note?.likeCount ?? 0,
+              commentCount: note?.commentCount ?? 0,
+              canDownload,
+              onBack: () => navigate('/'),
+              onLike: () => void onLike(),
+              onComment: () => setSheetOpen(true),
+              onDownload: () => void onDownload(),
+            }}
+          />
+        </MediaErrorBoundary>
       ) : (
         <div className="reader-page--state">
           <div className="glass-panel" style={{ borderRadius: 16, padding: 24 }}>无法加载手账内容</div>

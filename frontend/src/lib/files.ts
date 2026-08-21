@@ -1,15 +1,22 @@
 import type { AssetMeta } from '../types';
 
-// 素材 dataUrl 来自上传的 .tnote 包，只接受 data: 协议，防止远程 URL 被自动请求成信标。
-function safeInlineDataUrl(dataUrl: string | undefined) {
-  return dataUrl && dataUrl.startsWith('data:') ? dataUrl : undefined;
+// 素材 URL 只接受本包解析出的 data: / blob:，拒绝 http(s) 以免文档里的远程地址被自动请求成信标。
+// Blog 阅读器对音视频和 GLB 使用 Object URL（blob:），不能整文件转成 data URL。
+function safeLocalResourceUrl(dataUrl: string | undefined) {
+  if (!dataUrl) {
+    return undefined;
+  }
+  if (dataUrl.startsWith('data:') || dataUrl.startsWith('blob:')) {
+    return dataUrl;
+  }
+  return undefined;
 }
 
 export function assetDataUrl(asset?: Pick<AssetMeta, 'mimeType' | 'dataBase64' | 'dataUrl'> | null) {
   if (!asset) {
     return undefined;
   }
-  const inline = safeInlineDataUrl(asset.dataUrl);
+  const inline = safeLocalResourceUrl(asset.dataUrl);
   if (inline) {
     return inline;
   }
@@ -23,7 +30,7 @@ export function assetCoverDataUrl(asset?: Pick<AssetMeta, 'coverMimeType' | 'cov
   if (!asset) {
     return undefined;
   }
-  const inline = safeInlineDataUrl(asset.coverDataUrl);
+  const inline = safeLocalResourceUrl(asset.coverDataUrl);
   if (inline) {
     return inline;
   }
@@ -37,7 +44,7 @@ export function assetPosterDataUrl(asset?: Pick<AssetMeta, 'posterDataBase64' | 
   if (!asset) {
     return undefined;
   }
-  const inline = safeInlineDataUrl(asset.posterDataUrl);
+  const inline = safeLocalResourceUrl(asset.posterDataUrl);
   if (inline) {
     return inline;
   }

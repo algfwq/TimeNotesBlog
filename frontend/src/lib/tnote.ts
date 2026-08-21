@@ -7,12 +7,36 @@ export type LoadedTNote = {
 };
 
 function bytesToObjectUrl(mime: string, bytes: Uint8Array): string {
-  const copy = new Uint8Array(bytes.byteLength);
-  copy.set(bytes);
+  const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
   const blob = new Blob([copy], {
     type: mime || 'application/octet-stream',
   });
   return URL.createObjectURL(blob);
+}
+
+function normalizeArchivePath(path: string) {
+  return path.replace(/\\/g, '/').replace(/^\/+/, '');
+}
+
+function zipEntry(zip: JSZip, path: string, hash?: string) {
+  const normalized = normalizeArchivePath(path);
+  if (normalized) {
+    const direct = zip.file(normalized);
+    if (direct && !direct.dir) {
+      return direct;
+    }
+  }
+  const files = zip.filter((_name, file) => !file.dir);
+  if (normalized) {
+    const byName = files.find((file) => file.name === normalized || file.name.endsWith(`/${normalized}`));
+    if (byName) {
+      return byName;
+    }
+  }
+  if (hash) {
+    return files.find((file) => file.name.includes(hash)) ?? null;
+  }
+  return null;
 }
 
 function asString(value: unknown, fallback = '') {
@@ -99,14 +123,12 @@ async function hydrateGroup(zip: JSZip, items: AssetMeta[] | undefined, objectUr
   const out: AssetMeta[] = [];
   for (const item of items) {
     const next = { ...item };
-    if (item.path) {
-      const file = zip.file(item.path);
-      if (file) {
-        const buf = await file.async('uint8array');
-        const url = bytesToObjectUrl(item.mimeType || 'application/octet-stream', buf);
-        objectUrls.push(url);
-        next.dataUrl = url;
-      }
+    const file = zipEntry(zip, item.path, item.hash);
+    if (file) {
+      const buf = await file.async('uint8array');
+      const url = bytesToObjectUrl(item.mimeType || 'application/octet-stream', buf);
+      objectUrls.push(url);
+      next.dataUrl = url;
     }
     if (next.coverDataBase64 && !next.coverDataUrl) {
       next.coverDataUrl = `data:${next.coverMimeType || 'image/jpeg'};base64,${next.coverDataBase64}`;

@@ -5,6 +5,7 @@ import { SideSheet } from '@douyinfe/semi-ui';
 import * as THREE from 'three';
 import type { AssetMeta, NoteElement, ResourceTransferProgress } from '../../types';
 import { assetDataUrl, mergeAssetWithCache } from '../../lib/files';
+import { MediaErrorBoundary } from '../MediaErrorBoundary';
 
 interface ModelElementProps {
   element: NoteElement;
@@ -64,13 +65,18 @@ export function ModelElement({ element: _element, asset, progress, readOnly: _re
         onPointerDown={stopPointer}
         onWheel={stopPointer}
       >
-        <Canvas
-          flat
-          camera={{ position: [3, 2, 5], fov: 45 }}
-          gl={{ antialias: true, alpha: true, preserveDrawingBuffer: false, powerPreference: 'high-performance' }}
-          style={{ position: 'absolute', inset: 0, background: 'linear-gradient(135deg, #e8e2d6, #d9d3c7)' }}
-          dpr={[1, 2]}
-        >
+        <MediaErrorBoundary>
+          <Canvas
+            flat
+            camera={{ position: [3, 2, 5], fov: 45 }}
+            gl={{ antialias: true, alpha: true, preserveDrawingBuffer: false, powerPreference: 'high-performance' }}
+            style={{ position: 'absolute', inset: 0, background: 'linear-gradient(135deg, #e8e2d6, #d9d3c7)' }}
+            dpr={[1, 2]}
+            onCreated={(state) => {
+              const canvas = state.gl.domElement;
+              canvas.addEventListener('webglcontextlost', (event) => event.preventDefault(), false);
+            }}
+          >
             <ambientLight intensity={0.6} />
             <directionalLight position={[5, 8, 5]} intensity={0.8} />
             <directionalLight position={[-3, 2, -3]} intensity={0.3} />
@@ -85,6 +91,7 @@ export function ModelElement({ element: _element, asset, progress, readOnly: _re
               makeDefault
             />
           </Canvas>
+        </MediaErrorBoundary>
         {hovered && (
           <button
             type="button"
@@ -117,7 +124,7 @@ export function ModelElement({ element: _element, asset, progress, readOnly: _re
 }
 
 function ModelScene({ src }: { src: string }) {
-  const gltf = useGLTF(src) as { scene: THREE.Group };
+  const gltf = useGLTF(src, false, false) as { scene: THREE.Group };
   const processedRef = useRef<THREE.Group | null>(null);
 
   if (processedRef.current) {
@@ -163,6 +170,7 @@ function ModelViewerSideSheet({ visible, src, name, onClose }: { visible: boolea
       style={{ width: 'min(800px, 88vw)' }}
     >
       <div className="flex min-h-0 flex-1" style={{ background: '#1a1a2e' }} onWheel={stopWheel}>
+        <MediaErrorBoundary>
         <Canvas
           camera={{ position: [4, 3, 6], fov: 40 }}
           gl={{ antialias: true, alpha: false, preserveDrawingBuffer: false }}
@@ -183,13 +191,14 @@ function ModelViewerSideSheet({ visible, src, name, onClose }: { visible: boolea
             makeDefault
           />
         </Canvas>
+        </MediaErrorBoundary>
       </div>
     </SideSheet>
   );
 }
 
 function SideSheetModelScene({ src }: { src: string }) {
-  const gltf = useGLTF(src) as { scene: THREE.Group };
+  const gltf = useGLTF(src, false, false) as { scene: THREE.Group };
   const processedRef = useRef<THREE.Group | null>(null);
 
   if (processedRef.current) {

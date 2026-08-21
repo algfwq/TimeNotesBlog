@@ -317,6 +317,8 @@ func addrIsLoopbackHost(addr string) bool {
 
 // securityHeadersMiddleware 给所有响应补基础安全头。
 // CSP 允许 style inline（Tailwind/Semi 运行时注入）、blob:/data: 媒体（阅读器渲染）；
+// connect-src 需放行 blob:/data:：阅读器把 .tnote 内的 GLB/音视频解出为 Object URL 后由
+// three.js GLTFLoader / fetch 以 XHR(fetch) 方式拉取，仅 img/media-src 放行不够；
 // script 的 unsafe-eval 是 VChart 统计图与 setImmediate polyfill 用 new Function 构造访问器所需，
 // 外部脚本加载仍被禁止——这是把 XSS 影响压制在"无法加载外部脚本"的关键一层。
 func securityHeadersMiddleware(c fiber.Ctx) error {
@@ -327,7 +329,7 @@ func securityHeadersMiddleware(c fiber.Ctx) error {
 			"img-src 'self' data: blob:; "+
 			"media-src 'self' data: blob:; "+
 			"font-src 'self' data:; "+
-			"connect-src 'self' ws: wss:; "+
+			"connect-src 'self' blob: data: ws: wss:; "+
 			"frame-ancestors 'none'; "+
 			"base-uri 'self'; "+
 			"form-action 'self'")
