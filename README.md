@@ -106,14 +106,14 @@ Copy-Item config.example.json config.json
 ```json
 {
   "addr": "0.0.0.0:8090",
-  "jwtSecret": "请换成足够长的随机字符串（建议 ≥32 字符）"
+  "jwtSecret": "请换成足够长的随机字符串（必须 ≥32 字符，如 openssl rand -hex 32 的输出）"
 }
 ```
 
 | 配置项 | 建议 |
 |--------|------|
 | `addr` | 本机调试可用 `127.0.0.1:8090`；对外服务用 `0.0.0.0:8090` |
-| `jwtSecret` | **生产必须**设置强随机串；过弱会导致进程拒绝启动 |
+| `jwtSecret` | **生产必须**设置长度 ≥32 字符的强随机串（16–31 字符会直接拒绝启动） |
 | `dbPath` / `notesDir` / `logPath` | 默认为相对路径，相对**进程工作目录**；生产可改为绝对路径 |
 
 也可用环境变量覆盖（优先级高于配置文件部分字段）：
@@ -129,6 +129,8 @@ Copy-Item config.example.json config.json
 | `TIMENOTES_BLOG_CORS_ORIGINS` | 逗号分隔 Origin 白名单 |
 | `TIMENOTES_BLOG_GEO_URL` | 自定义 GeoIP URL 模板（含 `{ip}`） |
 | `TIMENOTES_BLOG_GEO_API_KEY` | GeoIP API Key（若需要） |
+| `TIMENOTES_BLOG_MAX_UPLOAD_BYTES` | 单个 `.tnote` 上传体积上限（字节，默认 104857600） |
+| `TIMENOTES_BLOG_LOG_MAX_BYTES` | 日志文件体积上限（字节，超出截断，默认 5242880） |
 
 ### 3. 启动
 
@@ -298,18 +300,18 @@ WantedBy=multi-user.target
 
 ## GeoIP（可切换多源）
 
-默认：
+默认（免 API key、HTTPS，见 `config.example.json`）：
 
 ```json
 "geo": {
-  "provider": "ip-api",
-  "urlTemplate": "http://ip-api.com/json/{ip}?fields=status,message,country,regionName,city,lat,lon,query",
+  "provider": "ipwhois",
+  "urlTemplate": "https://ipwho.is/{ip}",
   "timeoutMs": 3000,
   "cacheTTLHours": 168
 }
 ```
 
-换成其它 HTTP JSON 源时：
+ipwho.is 的字段名（`latitude` / `longitude` / `country` 等）由内置默认直接对齐，无需额外映射。换成其它 HTTP JSON 源时，才需要显式配置字段映射：
 
 ```json
 "geo": {
